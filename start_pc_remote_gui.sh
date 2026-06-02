@@ -13,6 +13,7 @@ G1_TUNNEL_PORT="${G1_TUNNEL_PORT:-15055}"
 SSH_CHECK_OPTS=(-o BatchMode=yes -o ConnectTimeout=2)
 TUNNEL_PID=""
 BACKEND_ADDR=""
+BACKEND_HOST=""
 export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8}"
 export no_proxy="${no_proxy:-$NO_PROXY}"
 
@@ -39,6 +40,24 @@ can_ssh() {
     ssh "${SSH_CHECK_OPTS[@]}" "${G1_USER}@${host}" "true" >/dev/null 2>&1
 }
 
+start_remote_backend() {
+    local host="$1"
+    echo "[pc-gui] backend not running, starting on ${host}..." >&2
+    ssh "${SSH_CHECK_OPTS[@]}" "${G1_USER}@${host}" \
+        "cd /home/unitree/zgx_g1 && mkdir -p .runtime && if ! ss -ltn | grep -q ':${G1_BACKEND_PORT} '; then nohup ./start_g1_backend.sh > .runtime/g1_backend.log 2>&1 < /dev/null & fi"
+    for _ in $(seq 1 40); do
+        if can_http "$host"; then
+            BACKEND_ADDR="${host}:${G1_BACKEND_PORT}"
+            BACKEND_HOST="$host"
+            return 0
+        fi
+        sleep 0.5
+    done
+    echo "[pc-gui] backend did not become ready on ${host}; last log:" >&2
+    ssh "${SSH_CHECK_OPTS[@]}" "${G1_USER}@${host}" "tail -80 /home/unitree/zgx_g1/.runtime/g1_backend.log 2>/dev/null || true" >&2 || true
+    return 1
+}
+
 start_tunnel() {
     local host="$1"
     echo "[pc-gui] direct HTTP blocked, opening SSH tunnel ${G1_TUNNEL_PORT}->${host}:${G1_BACKEND_PORT}..." >&2
@@ -49,6 +68,7 @@ start_tunnel() {
     for _ in $(seq 1 20); do
         if can_http "127.0.0.1" "$G1_TUNNEL_PORT"; then
             BACKEND_ADDR="127.0.0.1:${G1_TUNNEL_PORT}"
+            BACKEND_HOST="$host"
             return 0
         fi
         sleep 0.2
@@ -70,9 +90,13 @@ discover_backend() {
     if [ -n "$G1_BACKEND_HOST" ]; then
         if can_http "$G1_BACKEND_HOST"; then
             BACKEND_ADDR="${G1_BACKEND_HOST}:${G1_BACKEND_PORT}"
+            BACKEND_HOST="$G1_BACKEND_HOST"
             return 0
         fi
         if can_ssh "$G1_BACKEND_HOST"; then
+            if start_remote_backend "$G1_BACKEND_HOST"; then
+                return 0
+            fi
             start_tunnel "$G1_BACKEND_HOST"
             return 0
         fi
@@ -83,9 +107,13 @@ discover_backend() {
         echo "[pc-gui] checking backend ${host}:${G1_BACKEND_PORT}..." >&2
         if can_http "$host"; then
             BACKEND_ADDR="${host}:${G1_BACKEND_PORT}"
+            BACKEND_HOST="$host"
             return 0
         fi
         if can_ssh "$host"; then
+            if start_remote_backend "$host"; then
+                return 0
+            fi
             start_tunnel "$host"
             return 0
         fi
@@ -96,9 +124,13 @@ discover_backend() {
             echo "[pc-gui] probing backend ${host}:${G1_BACKEND_PORT}..." >&2
             if can_http "$host"; then
                 BACKEND_ADDR="${host}:${G1_BACKEND_PORT}"
+                BACKEND_HOST="$host"
                 return 0
             fi
             if can_ssh "$host"; then
+                if start_remote_backend "$host"; then
+                    return 0
+                fi
                 start_tunnel "$host"
                 return 0
             fi
@@ -120,6 +152,9 @@ export HONGTU_G1_BACKEND_URL="http://${BACKEND_ADDR}"
 export HONGTU_REMOTE_AUTO_CONNECT="${HONGTU_REMOTE_AUTO_CONNECT:-1}"
 
 echo "[pc-gui] backend: $HONGTU_G1_BACKEND_URL"
+if [ -n "$BACKEND_HOST" ]; then
+    echo "[pc-gui] G1 host: $BACKEND_HOST"
+fi
 if [ "${HONGTU_PC_GUI_DRY_RUN:-0}" = "1" ]; then
     echo "[pc-gui] dry run ok"
     exit 0

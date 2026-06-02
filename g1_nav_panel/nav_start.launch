@@ -3,12 +3,12 @@
     G1 Navigation Panel - 导航启动文件（带参数）
     由 g1_nav_panel/main.py 调用，传递自定义地图路径
     -->
-    <arg name="map_yaml" default="$(find fastlio)/../../G1map.yaml" />
+    <arg name="map_yaml" default="/home/unitree/zgx_g1/.runtime/maps/G1map.yaml" />
     <arg name="pcd_path" default="$(find fastlio)/PCD/map.pcd" />
 
     <!-- TF: body → base_link -->
-    <node pkg="tf" type="static_transform_publisher" name="base_to_body"
-          args="0.0 0 0.0 3.1416 3.1416 0 /body /base_link 1" />
+    <node pkg="tf" type="static_transform_publisher" name="$(anon base_to_body)"
+          args="0.0 0 0.0 3.1416 3.1416 0 body base_link 100" />
 
     <!-- Livox 雷达驱动 -->
     <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360.launch" />
@@ -28,7 +28,9 @@
     <node name="map_server" pkg="map_server" type="map_server" args="$(arg map_yaml)" output="screen" />
 
     <!-- 点云降采样 -->
-    <include file="$(find tool)/launch/downsample_pointcloud.launch" />
+    <include file="$(find tool)/launch/downsample_pointcloud.launch">
+        <arg name="pcd_file" value="$(find fastlio)/PCD/ground_map.pcd" />
+    </include>
 
     <!-- move_base 导航栈 -->
     <include file="$(find xju_pnc)/launch/move_base.launch" />

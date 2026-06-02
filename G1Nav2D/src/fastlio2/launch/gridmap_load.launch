@@ -5,7 +5,7 @@
     <arg name="rviz" default="true" />
 
     <!-- 设置地图的配置文件 -->
-    <arg name="2dmap_file" default="/home/zgx/Desktop/G1map.yaml" />
+    <arg name="2dmap_file" default="/home/unitree/zgx_g1/.runtime/maps/G1map.yaml" />
     <arg name="2dmap_frame" default="map"/>
 
     <!-- 直接发布到标准 /map 话题 -->

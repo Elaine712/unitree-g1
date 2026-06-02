@@ -86,7 +86,7 @@ class G1RemoteClient:
         return self._request("POST", "/api/speak", {
             "text": text,
             "speaker_id": int(speaker_id),
-        }, timeout=12.0)
+        }, timeout=3.0)
 
     def volume(self, value):
         return self._request("POST", "/api/volume", {"value": int(value)})
@@ -123,3 +123,28 @@ class G1RemoteClient:
 
     def arm_current(self):
         return self._request("GET", "/api/arm/current", timeout=4.0)
+
+    def nav_start(self, map_yaml=None, pcd_path=None):
+        payload = {}
+        if map_yaml:
+            payload["map_yaml"] = map_yaml
+        if pcd_path:
+            payload["pcd_path"] = pcd_path
+        return self._request("POST", "/api/nav/start", payload, timeout=12.0)
+
+    def nav_stop(self):
+        return self._request("POST", "/api/nav/stop", {}, timeout=8.0)
+
+    def nav_goal(self, x, y, yaw):
+        return self._request("POST", "/api/nav/goal", {
+            "x": float(x),
+            "y": float(y),
+            "yaw": float(yaw),
+        }, timeout=25.0)
+
+    def nav_reloc(self, x, y, yaw):
+        return self._request("POST", "/api/nav/reloc", {
+            "x": float(x),
+            "y": float(y),
+            "yaw": float(yaw),
+        }, timeout=6.0)

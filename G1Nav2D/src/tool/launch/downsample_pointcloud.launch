@@ -1,6 +1,6 @@
 <launch>
     <!-- 声明参数，允许上层 launch 传入 -->
-    <arg name="pcd_file" default="/home/nvidia/map_output.pcd"/>
+    <arg name="pcd_file" default="/home/unitree/zgx_g1/G1Nav2D/src/fastlio2/PCD/ground_map.pcd"/>
     <arg name="output_topic" default="filtered_cloud"/>
     <arg name="voxel_size" default="0.2"/>
 
@@ -12,4 +12,3 @@
     <!-- 启动节点 -->
     <node name="downsample_pointcloud" pkg="tool" type="downsample_pointcloud" output="screen"/>
 </launch>
-

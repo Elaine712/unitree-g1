@@ -7,8 +7,10 @@ Unitree DDS/RPC calls stay local to the G1 body.
 
 import argparse
 import json
+import math
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -153,10 +155,39 @@ WRIST_MOTORS = {
 
 def init_channel(net_if):
     net_if = (net_if or "").strip()
-    if net_if and net_if.lower() not in ("auto", "local", "none"):
+    if net_if.lower() == "auto":
+        net_if = detect_net_if()
+    if net_if and net_if.lower() not in ("local", "none"):
         ChannelFactoryInitialize(0, net_if)
     else:
         ChannelFactoryInitialize(0)
+    return net_if or "default"
+
+
+def detect_net_if():
+    try:
+        out = subprocess.check_output(
+            ["ip", "-o", "-4", "addr", "show", "scope", "global"],
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return ""
+    candidates = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        name = parts[1]
+        ip = parts[3].split("/", 1)[0]
+        if name.startswith(("lo", "docker", "br-", "veth")):
+            continue
+        candidates.append((name, ip))
+    for prefix in ("eth", "en", "wlan", "wl"):
+        for name, _ip in candidates:
+            if name.startswith(prefix):
+                return name
+    return candidates[0][0] if candidates else ""
 
 
 class G1Robot:
@@ -174,6 +205,21 @@ class G1Robot:
         self.hand_pub_l = None
         self.hand_pub_r = None
         self.hand_state = {"l": {}, "r": {}}
+        self.nav_proc = None
+        self.nav_bridge_started = False
+        self.nav_status = "stopped"
+        self.nav_last_goal = None
+        self.nav_pose = None
+        self.nav_pcd_path = None
+        self.nav_last_reloc = None
+        self.nav_last_reloc_error = None
+        self.nav_reloc_busy = False
+        self.nav_reloc_pending = None
+        self.nav_reloc_lock = threading.Lock()
+        self.nav_ros_ready = threading.Event()
+        self.nav_goal_pub = None
+        self.nav_initpose_pub = None
+        self.nav_clear_costmaps = None
 
         self.arm_ready = False
         self.arm_active = False
@@ -201,7 +247,8 @@ class G1Robot:
             if self.ready:
                 return
             self.log(f"[G1服务] 初始化 DDS: {self.net_if}")
-            init_channel(self.net_if)
+            self.net_if = init_channel(self.net_if)
+            self.log(f"[G1服务] DDS 实际网卡: {self.net_if}")
 
             self.loco = LocoClient()
             self.loco.SetTimeout(10.0)
@@ -275,8 +322,362 @@ class G1Robot:
             "arm_active": self.arm_active,
             "hand_ready": self.hand_ready,
             "moving": self.moving,
+            "nav": self.nav_status,
+            "nav_running": bool(self.nav_proc and self.nav_proc.poll() is None),
+            "nav_last_goal": self.nav_last_goal,
+            "nav_last_reloc": self.nav_last_reloc,
+            "nav_last_reloc_error": self.nav_last_reloc_error,
+            "nav_reloc_busy": self.nav_reloc_busy,
+            "nav_pose": self.nav_pose,
             "actions": sorted(ARM_ACTIONS.keys()),
         }
+
+    def _ros_env(self):
+        env = os.environ.copy()
+        env["ROS_MASTER_URI"] = env.get("ROS_MASTER_URI", "http://localhost:11311")
+        return env
+
+    def nav_start(self, map_yaml=None, pcd_path=None):
+        with self.lock:
+            if self.nav_proc and self.nav_proc.poll() is None:
+                self.nav_status = "running"
+                self._start_nav_bridge()
+                return
+            self._cleanup_stale_nav_processes()
+            map_yaml = map_yaml or os.environ.get(
+                "HONGTU_MAP_YAML",
+                os.path.join(BASE, ".runtime", "maps", "G1map.yaml"),
+            )
+            pcd_path = pcd_path or os.environ.get(
+                "HONGTU_PCD_PATH",
+                os.path.join(BASE, "G1Nav2D", "src", "fastlio2", "PCD", "map.pcd"),
+            )
+            if not os.path.exists(map_yaml):
+                raise FileNotFoundError(f"地图 YAML 不存在: {map_yaml}")
+            if not os.path.exists(pcd_path):
+                raise FileNotFoundError(f"PCD 地图不存在: {pcd_path}")
+            self.nav_pcd_path = pcd_path
+            launch_file = os.path.join(BASE, "g1_nav_panel", "nav_start.launch")
+            cmd = ["roslaunch", launch_file, f"map_yaml:={map_yaml}", f"pcd_path:={pcd_path}"]
+            self.log("[导航] 启动: " + " ".join(cmd))
+            self.nav_proc = subprocess.Popen(
+                cmd,
+                env=self._ros_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN),
+            )
+            threading.Thread(target=self._nav_log_loop, daemon=True).start()
+            self.nav_status = "starting"
+            self._start_nav_bridge()
+            if os.environ.get("HONGTU_AUTO_RELOC", "1").lower() not in ("0", "false", "no"):
+                threading.Thread(target=self.nav_auto_reloc, daemon=True).start()
+
+    def _nav_is_running(self):
+        return bool(self.nav_proc and self.nav_proc.poll() is None)
+
+    def _cleanup_stale_nav_processes(self):
+        patterns = [
+            os.path.join(BASE, "g1_nav_panel", "nav_start.launch"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "livox_ros_driver2", "livox_ros_driver2_node"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "fastlio", "localizer_node"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "fastlio", "slam_reloc.py"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "tool", "downsample_pointcloud"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "tool", "body2any_pointcloud"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "xju_pnc", "costmap_clear"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "pointcloud_to_laserscan", "pointcloud_to_laserscan_node"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "velocity_smoother_ema", "velocity_smoother_ema_node"),
+            "/opt/ros/noetic/lib/move_base/move_base cmd_vel:=/cmd_vel odom:=slam_odom",
+            os.path.join(BASE, ".runtime", "maps", "G1map.yaml"),
+            "body base_link 100",
+        ]
+        for pattern in patterns:
+            try:
+                subprocess.run(["pkill", "-f", pattern], check=False)
+            except Exception:
+                pass
+        time.sleep(0.3)
+
+    def _nav_log_loop(self):
+        proc = self.nav_proc
+        if not proc or not proc.stdout:
+            return
+        for line in iter(proc.stdout.readline, ""):
+            self.log("[nav] " + line.rstrip())
+        self.nav_status = "stopped"
+        self._reset_nav_bridge_state()
+        self.log("[导航] 进程已退出")
+
+    def _reset_nav_bridge_state(self):
+        self.nav_bridge_started = False
+        self.nav_ros_ready.clear()
+        self.nav_goal_pub = None
+        self.nav_initpose_pub = None
+        self.nav_clear_costmaps = None
+        self.nav_pose = None
+
+    def nav_stop(self):
+        with self.lock:
+            self.ensure_arm_released("停止导航前")
+            if self.nav_proc and self.nav_proc.poll() is None:
+                self.nav_proc.terminate()
+                try:
+                    self.nav_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.nav_proc.kill()
+            self.nav_proc = None
+            self.nav_status = "stopped"
+            self._reset_nav_bridge_state()
+            if self.ready:
+                try:
+                    self.stop()
+                except Exception:
+                    pass
+            self._cleanup_stale_nav_processes()
+
+    def _start_nav_bridge(self):
+        if self.nav_bridge_started:
+            return
+        self.nav_bridge_started = True
+        threading.Thread(target=self._nav_bridge_loop, daemon=True).start()
+
+    def _nav_bridge_loop(self):
+        try:
+            import rospy
+            from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
+            from actionlib_msgs.msg import GoalStatusArray
+            from nav_msgs.msg import Odometry
+            from std_srvs.srv import Empty
+            import tf2_ros
+
+            if not rospy.core.is_initialized():
+                rospy.init_node("hongtu_g1_backend_nav", anonymous=True, disable_signals=True)
+
+            tf_buffer = tf2_ros.Buffer()
+            tf2_ros.TransformListener(tf_buffer)
+            self.nav_goal_pub = rospy.Publisher("/move_base_simple/goal", PoseStamped, queue_size=1)
+            self.nav_initpose_pub = rospy.Publisher("/initialpose", PoseWithCovarianceStamped, queue_size=1)
+            self.nav_clear_costmaps = rospy.ServiceProxy("/move_base/clear_costmaps", Empty)
+
+            def cmd_cb(msg):
+                if abs(msg.linear.x) < 0.001 and abs(msg.linear.y) < 0.001 and abs(msg.angular.z) < 0.001:
+                    self.stop()
+                else:
+                    self.move(msg.linear.x, msg.linear.y, msg.angular.z, continuous=True)
+
+            def status_cb(msg):
+                if msg.status_list:
+                    status_map = {0: "pending", 1: "active", 2: "preempted", 3: "succeeded", 4: "aborted", 5: "rejected", 8: "recalled"}
+                    self.nav_status = status_map.get(msg.status_list[-1].status, str(msg.status_list[-1].status))
+
+            def odom_cb(msg):
+                q = msg.pose.pose.orientation
+                x = msg.pose.pose.position.x
+                y = msg.pose.pose.position.y
+                siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+                cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+                yaw = math.atan2(siny_cosp, cosy_cosp)
+                try:
+                    t = tf_buffer.lookup_transform("map", "body", rospy.Time(0), rospy.Duration(0.05))
+                    x = t.transform.translation.x
+                    y = t.transform.translation.y
+                    tq = t.transform.rotation
+                    siny_cosp = 2.0 * (tq.w * tq.z + tq.x * tq.y)
+                    cosy_cosp = 1.0 - 2.0 * (tq.y * tq.y + tq.z * tq.z)
+                    yaw = math.atan2(siny_cosp, cosy_cosp)
+                except Exception:
+                    pass
+                self.nav_pose = {
+                    "x": x,
+                    "y": y,
+                    "yaw": yaw,
+                    "stamp": time.time(),
+                }
+
+            rospy.Subscriber("/cmd_vel", Twist, cmd_cb, queue_size=10)
+            rospy.Subscriber("/move_base/status", GoalStatusArray, status_cb, queue_size=10)
+            rospy.Subscriber("/slam_odom", Odometry, odom_cb, queue_size=10)
+            self.nav_ros_ready.set()
+            self.log("[导航] cmd_vel 桥接已启动")
+            rospy.spin()
+        except Exception as e:
+            self.log(f"[导航] cmd_vel 桥接失败: {e}")
+            self._reset_nav_bridge_state()
+
+    def _wait_nav_ros(self):
+        self._start_nav_bridge()
+        if not self.nav_ros_ready.wait(timeout=3.0):
+            raise RuntimeError("导航 ROS 桥接未就绪")
+
+    def _wait_slam_reloc(self, timeout=20.0):
+        import rospy
+        from fastlio.srv import SlamReLoc, SlamRelocCheck
+
+        rospy.wait_for_service("/slam_reloc", timeout=timeout)
+        rospy.wait_for_service("/slam_reloc_check", timeout=timeout)
+        return (
+            rospy.ServiceProxy("/slam_reloc", SlamReLoc),
+            rospy.ServiceProxy("/slam_reloc_check", SlamRelocCheck),
+        )
+
+    def _ensure_nav_goal_ready(self):
+        if not self._nav_is_running():
+            raise RuntimeError("导航未启动：请先调用 /api/nav/start")
+        self._wait_nav_ros()
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            if not self._nav_is_running():
+                raise RuntimeError("导航进程已退出，请查看 G1 后台日志")
+            if self.nav_goal_pub and self.nav_goal_pub.get_num_connections() > 0:
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("move_base 未就绪：/move_base_simple/goal 暂无订阅者")
+
+        pose_deadline = time.time() + 20.0
+        while time.time() < pose_deadline:
+            if not self._nav_is_running():
+                raise RuntimeError("导航进程已退出，请查看 G1 后台日志")
+            if self.nav_pose and (time.time() - float(self.nav_pose.get("stamp", 0))) < 3.0:
+                return
+            time.sleep(0.2)
+        raise RuntimeError("定位未就绪：未收到新鲜 /slam_odom")
+
+    def _publish_nav_msg(self, pub, msg, name, repeat=5):
+        if pub is None:
+            raise RuntimeError(f"{name} publisher 未就绪")
+        deadline = time.time() + 2.0
+        while pub.get_num_connections() == 0 and time.time() < deadline:
+            time.sleep(0.05)
+        if pub.get_num_connections() == 0:
+            self.log(f"[导航] {name} 暂无订阅者，仍尝试发布")
+        for _ in range(repeat):
+            pub.publish(msg)
+            time.sleep(0.05)
+
+    def nav_goal(self, x, y, yaw):
+        self._ensure_nav_goal_ready()
+        import rospy
+        from geometry_msgs.msg import PoseStamped
+
+        x, y, yaw = float(x), float(y), float(yaw)
+        msg = PoseStamped()
+        msg.header.frame_id = "map"
+        msg.header.stamp = rospy.Time.now()
+        msg.pose.position.x = x
+        msg.pose.position.y = y
+        msg.pose.position.z = 0.0
+        msg.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.orientation.w = math.cos(yaw / 2.0)
+        try:
+            self.nav_clear_costmaps()
+        except Exception as e:
+            self.log(f"[导航] 清除代价地图失败: {e}")
+        self._publish_nav_msg(self.nav_goal_pub, msg, "goal")
+        self.nav_last_goal = {"x": x, "y": y, "yaw": yaw}
+        self.nav_status = "goal_sent"
+        self.log(f"[导航] 目标已发布: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+
+    def nav_reloc(self, x, y, yaw):
+        x, y, yaw = float(x), float(y), float(yaw)
+        if not self._nav_is_running():
+            self.log("[重定位] 导航未运行，自动启动导航以执行 ICP")
+            self.nav_start()
+        self._wait_nav_ros()
+
+        with self.nav_reloc_lock:
+            self.nav_last_reloc = {"x": x, "y": y, "yaw": yaw, "queued": True}
+            self.nav_last_reloc_error = None
+            self.nav_status = "reloc_pending"
+            if self.nav_reloc_busy:
+                self.nav_reloc_pending = (x, y, yaw)
+                self.log(f"[重定位] 正在执行 ICP，已合并为最新请求: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+                return
+            self.nav_reloc_busy = True
+
+        threading.Thread(target=self._nav_reloc_worker, args=(x, y, yaw), daemon=True).start()
+        self.log(f"[重定位] 已排队后台执行: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+
+    def _nav_reloc_worker(self, x, y, yaw):
+        current = (x, y, yaw)
+        try:
+            while current:
+                try:
+                    self._nav_reloc_once(*current)
+                except Exception as e:
+                    self.nav_last_reloc_error = str(e)
+                    self.nav_status = "reloc_failed"
+                    self.log(f"[重定位] 后台执行失败: {e}")
+                with self.nav_reloc_lock:
+                    current = self.nav_reloc_pending
+                    self.nav_reloc_pending = None
+                    if not current:
+                        self.nav_reloc_busy = False
+                        break
+                    self.nav_last_reloc = {"x": current[0], "y": current[1], "yaw": current[2], "queued": True}
+                    self.nav_status = "reloc_pending"
+        finally:
+            with self.nav_reloc_lock:
+                self.nav_reloc_busy = False
+
+    def _nav_reloc_once(self, x, y, yaw):
+        self._wait_nav_ros()
+        import rospy
+        from geometry_msgs.msg import PoseWithCovarianceStamped
+
+        pcd_path = self.nav_pcd_path or os.environ.get(
+            "HONGTU_PCD_PATH",
+            os.path.join(BASE, "G1Nav2D", "src", "fastlio2", "PCD", "map.pcd"),
+        )
+        icp_ok = False
+        try:
+            reloc_srv, check_srv = self._wait_slam_reloc()
+            resp = reloc_srv(pcd_path, x, y, 0.0, 0.0, 0.0, yaw)
+            self.log(f"[重定位] ICP 服务已调用: status={getattr(resp, 'status', None)} msg={getattr(resp, 'message', '')}")
+            deadline = time.time() + 12.0
+            while time.time() < deadline:
+                chk = check_srv()
+                if getattr(chk, "status", 0):
+                    icp_ok = True
+                    break
+                time.sleep(0.2)
+        except Exception as e:
+            self.log(f"[重定位] ICP 服务失败，降级 initialpose: {e}")
+            self.nav_last_reloc_error = str(e)
+
+        if icp_ok:
+            self.log("[重定位] ICP 已成功，跳过 initialpose，使用 FAST-LIO 校准后的 map->body 位姿")
+        else:
+            msg = PoseWithCovarianceStamped()
+            msg.header.frame_id = "map"
+            msg.header.stamp = rospy.Time.now()
+            msg.pose.pose.position.x = x
+            msg.pose.pose.position.y = y
+            msg.pose.pose.position.z = 0.0
+            msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+            msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+            self._publish_nav_msg(self.nav_initpose_pub, msg, "initialpose")
+            self.log(f"[重定位] initialpose 已发布: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+        try:
+            self.nav_clear_costmaps()
+        except Exception as e:
+            self.log(f"[导航] 清除代价地图失败: {e}")
+        self.nav_status = "reloc_sent"
+        self.nav_last_reloc = {"x": x, "y": y, "yaw": yaw, "queued": False}
+        self.log(f"[重定位] 完成: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°) icp_ok={icp_ok}")
+
+    def nav_auto_reloc(self):
+        try:
+            time.sleep(float(os.environ.get("HONGTU_AUTO_RELOC_DELAY", "6")))
+            x = float(os.environ.get("HONGTU_START_X", "0.0"))
+            y = float(os.environ.get("HONGTU_START_Y", "0.0"))
+            yaw = math.radians(float(os.environ.get("HONGTU_START_YAW_DEG", "132")))
+            self.log(f"[重定位] 自动重定位: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+            self.nav_reloc(x, y, yaw)
+        except Exception as e:
+            self.log(f"[重定位] 自动重定位失败: {e}")
 
     def ensure_arm_released(self, reason=""):
         if self.arm_active:
@@ -328,7 +729,17 @@ class G1Robot:
             return
         with self.lock:
             self._require_ready()
-            self.audio.TtsMaker(text, int(speaker_id))
+            try:
+                self.audio.SetTimeout(2.0)
+            except Exception:
+                pass
+            code = self.audio.TtsMaker(text, int(speaker_id))
+            try:
+                self.audio.SetTimeout(10.0)
+            except Exception:
+                pass
+            if code not in (0, None):
+                raise RuntimeError(f"AudioClient TTS 返回错误码: {code}")
 
     def volume(self, value):
         with self.lock:
@@ -536,6 +947,10 @@ class G1Robot:
                     self.arm_targets[i] = max(lo, min(hi, val))
 
     def shutdown(self):
+        try:
+            self.nav_stop()
+        except Exception:
+            pass
         if self.ready:
             try:
                 self.stop()
@@ -596,18 +1011,14 @@ INDEX_HTML = r"""<!doctype html>
   </header>
   <nav class="tabs" id="tabs"></nav>
   <main>
-    <div class="tab active" id="tab-nav">
+    <div class="tab active" id="tab-main">
       <div class="grid">
-        <section><h2>地图 / 导航</h2><div class="mapbox">网页端当前聚焦 G1 本体控制。地图、重定位和航点规划请使用 PC 本地 GUI。</div></section>
-        <section><h2>导航联动</h2>
-          <textarea id="navTts" rows="3" placeholder="导航到达后的中文播报"></textarea>
-          <button onclick="speak(navTts.value)">播报</button>
-          <div class="row tight"><button onclick="cmd('/api/stand')">行走模式</button><button onclick="fsm(1)">阻尼模式</button><button onclick="fsm(3)">坐下</button></div>
+        <section><h2>导航</h2>
+          <div class="row tight"><button class="ok" onclick="cmd('/api/nav/start')">启动导航</button><button class="danger" onclick="cmd('/api/nav/stop')">停止导航</button><button onclick="poll()">刷新状态</button></div>
+          <div class="row"><input id="goalX" type="number" step="0.01" placeholder="目标 X"><input id="goalY" type="number" step="0.01" placeholder="目标 Y"><input id="goalYaw" type="number" step="1" placeholder="朝向 °"></div>
+          <div class="row tight"><button onclick="navGoal()">发送导航目标</button><button onclick="navReloc()">重定位</button></div>
+          <p class="muted">网页端可启动 G1 本体导航、发送目标点和重定位。地图可视化仍建议使用 PC GUI。</p>
         </section>
-      </div>
-    </div>
-    <div class="tab" id="tab-teleop">
-      <div class="grid">
         <section><h2>遥控</h2>
           <div class="row"><label>线速度<input id="lin" type="range" min="0" max="100" value="30"></label><label>角速度<input id="ang" type="range" min="0" max="100" value="50"></label></div>
           <div class="pad">
@@ -617,38 +1028,26 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         </section>
         <section><h2>FSM 模式</h2><div class="row tight"><button onclick="cmd('/api/stand')">行走模式</button><button onclick="fsm(1)">阻尼模式</button><button onclick="fsm(3)">坐下</button><button onclick="cmd('/api/stop')">停止移动</button></div></section>
-      </div>
-    </div>
-    <div class="tab" id="tab-actions">
-      <div class="grid">
         <section><h2>常用动作</h2><div id="commonActions" class="tight"></div></section>
         <section><h2>全部动作</h2><div id="allActions" class="tight"></div></section>
         <section><h2>语音播报</h2><textarea id="tts" rows="4" placeholder="输入中文播报内容"></textarea><button class="ok" onclick="speak(tts.value)">播报</button><div id="phrases" class="tight"></div></section>
         <section><h2>LED / 音量</h2><div class="row tight" id="leds"></div><label>音量 <span id="volText">100</span>%<input id="vol" type="range" min="0" max="100" value="100" oninput="volText.textContent=this.value" onchange="cmd('/api/volume',{value:+this.value})"></label></section>
       </div>
     </div>
-    <div class="tab" id="tab-hand">
+    <div class="tab" id="tab-advanced">
       <div class="grid">
         <section><h2>灵巧手手势</h2><div class="row"><select id="handSide"><option value="r">右手</option><option value="l">左手</option></select><button onclick="handBoth()">双手同步</button></div><div id="hands" class="tight"></div></section>
         <section><h2>自定义角度</h2><div id="handSliders"></div><button class="ok" onclick="sendHandAngles()">发送角度</button></section>
-      </div>
-    </div>
-    <div class="tab" id="tab-pose">
-      <div class="grid">
         <section><h2>arm_sdk 低阶臂控</h2><div class="row"><button class="warn" onclick="armActivate()">激活臂控</button><button class="danger" onclick="armRelease()">释放臂控</button><button onclick="armRead()">读取当前姿态</button><button onclick="armZero()">归零</button></div><p class="muted">执行预设动作、FSM 切换、站立前，后台会自动释放 arm_sdk。</p></section>
         <section><h2>双臂关节</h2><div id="armSliders"></div><button class="ok" onclick="sendArm()">发送当前关节</button></section>
-      </div>
-    </div>
-    <div class="tab" id="tab-settings">
-      <div class="grid">
         <section><h2>后台状态</h2><pre id="statusJson"></pre></section>
+        <section><h2>日志</h2><pre id="log"></pre></section>
         <section><h2>连接信息</h2><p class="muted">默认端口 5055。若浏览器不能直连，请在 PC 运行 start_pc_remote_gui.sh 自动建立 SSH 隧道，然后访问 http://127.0.0.1:15055/。</p><button onclick="poll()">刷新状态</button></section>
       </div>
     </div>
-    <div class="tab" id="tab-log"><section><h2>日志</h2><pre id="log"></pre></section></div>
   </main>
 <script>
-const tabDefs=[["tab-nav","导航"],["tab-teleop","遥控"],["tab-actions","动作"],["tab-hand","灵巧手"],["tab-pose","姿态"],["tab-settings","设置"],["tab-log","日志"]];
+const tabDefs=[["tab-main","导航控制"],["tab-advanced","姿态设置"]];
 const presets=["张开","握拳","指向","OK","点赞","三指捏","半开","点按"];
 const common=[["face wave","挥手"],["clap","鼓掌"],["hug","拥抱"],["heart","比心"],["right hand up","举手"],["reject","拒绝"],["shake hand","握手"],["x-ray","展示"],["high five","击掌"]];
 const phrases=["欢迎参观","请跟我来","这是我们的展品","谢谢大家","请注意安全","正在前往下一个展品"];
@@ -671,6 +1070,7 @@ function add(s){log.textContent=(new Date().toLocaleTimeString()+" "+s+"\n"+log.
 async function cmd(path,data={}){try{let r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});let j=await r.json();add((j.ok?"OK ":"ERR ")+path+" "+JSON.stringify(j.data||j.error||{}));await poll();return j}catch(e){add("失败 "+path+" "+e);return {ok:false,error:String(e)}}}
 function move(x,y,z){let lin=+document.getElementById("lin").value/100,ang=+document.getElementById("ang").value/100;cmd("/api/move",{vx:x*lin,vy:y*lin,wz:z*ang,continuous:false})}
 function stop(){cmd("/api/stop")}function fsm(id){cmd("/api/fsm",{id})}function action(name){cmd("/api/coordinated",{name})}function speak(text){cmd("/api/speak",{text:text||""})}
+function yawRad(){return (+goalYaw.value||0)*Math.PI/180}function navGoal(){cmd("/api/nav/goal",{x:+goalX.value||0,y:+goalY.value||0,yaw:yawRad()})}function navReloc(){cmd("/api/nav/reloc",{x:+goalX.value||0,y:+goalY.value||0,yaw:yawRad()})}
 function handPreset(preset){cmd("/api/hand/preset",{lr:handSide.value,preset})}function handBoth(){presets.forEach(()=>{});cmd("/api/hand/angles",{lr:"l",angles:hand});cmd("/api/hand/angles",{lr:"r",angles:hand})}
 function setHand(i,v){hand[i]=v;document.getElementById("handv"+i).textContent=v}function sendHandAngles(){cmd("/api/hand/angles",{lr:handSide.value,angles:hand})}
 function setArm(i,v){arm[i]=+v;document.getElementById("armv"+i).textContent=(+v).toFixed(2)}function sendArm(){cmd("/api/arm/joints",{joints:arm})}
@@ -752,6 +1152,18 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/fsm":
                 r.fsm(data.get("id"))
                 self._ok()
+            elif path == "/api/nav/start":
+                r.nav_start(data.get("map_yaml"), data.get("pcd_path"))
+                self._ok(r.status())
+            elif path == "/api/nav/stop":
+                r.nav_stop()
+                self._ok(r.status())
+            elif path == "/api/nav/goal":
+                r.nav_goal(data.get("x", 0), data.get("y", 0), data.get("yaw", 0))
+                self._ok(r.status())
+            elif path == "/api/nav/reloc":
+                r.nav_reloc(data.get("x", 0), data.get("y", 0), data.get("yaw", 0))
+                self._ok(r.status())
             elif path == "/api/action":
                 r.action(name=data.get("name"), action_id=data.get("id"))
                 self._ok()

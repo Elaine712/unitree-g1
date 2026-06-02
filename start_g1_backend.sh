@@ -19,6 +19,9 @@ export LC_CTYPE="${LC_CTYPE:-${LANG}}"
 if [ -f /opt/ros/noetic/setup.bash ]; then
     source /opt/ros/noetic/setup.bash
 fi
+if [ -f "${BASE}/G1Nav2D/devel/setup.bash" ]; then
+    source "${BASE}/G1Nav2D/devel/setup.bash"
+fi
 
 cd "$BASE"
 

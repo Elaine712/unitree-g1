@@ -273,10 +273,40 @@ DEFAULT_CONFIG = {
 def init_unitree_channel(net_if):
     """Initialize Unitree DDS; empty/auto lets robot-side SDK choose locally."""
     net_if = (net_if or "").strip()
-    if net_if and net_if.lower() not in ("auto", "local", "none"):
+    if net_if.lower() == "auto":
+        net_if = detect_net_if()
+    if net_if and net_if.lower() not in ("local", "none"):
         ChannelFactoryInitialize(0, net_if)
     else:
         ChannelFactoryInitialize(0)
+    return net_if or "default"
+
+
+def detect_net_if():
+    try:
+        out = subprocess.check_output(
+            ["ip", "-o", "-4", "addr", "show", "scope", "global"],
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return ""
+    candidates = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        name = parts[1]
+        ip = parts[3].split("/", 1)[0]
+        if name.startswith(("lo", "docker", "br-", "veth")):
+            continue
+        candidates.append((name, ip))
+    for prefix in ("eth", "en", "wlan", "wl"):
+        for name, _ip in candidates:
+            if name.startswith(prefix):
+                return name
+    return candidates[0][0] if candidates else ""
+
 
 NAV_STATUS_MAP = {
     0: "排队中", 1: "导航中", 2: "被抢占",
@@ -305,6 +335,104 @@ def save_config(cfg):
             json.dump(cfg, f, indent=2, ensure_ascii=False)
     except Exception:
         pass
+
+
+class _MapObj:
+    pass
+
+
+def _parse_map_yaml(path):
+    values = {}
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.split("#", 1)[0].strip()
+            if not line or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            values[key.strip()] = value.strip().strip("'\"")
+    if "image" not in values:
+        raise ValueError("地图 YAML 缺少 image 字段")
+    image = values["image"]
+    if not os.path.isabs(image):
+        image = os.path.abspath(os.path.join(os.path.dirname(path), image))
+    origin = values.get("origin", "[0, 0, 0]").strip("[]")
+    origin_vals = [float(v.strip()) for v in origin.split(",") if v.strip()]
+    while len(origin_vals) < 3:
+        origin_vals.append(0.0)
+    return {
+        "image": image,
+        "resolution": float(values.get("resolution", 0.05)),
+        "origin": origin_vals[:3],
+        "negate": int(values.get("negate", 0)),
+        "occupied_thresh": float(values.get("occupied_thresh", 0.65)),
+        "free_thresh": float(values.get("free_thresh", 0.196)),
+    }
+
+
+def _read_pgm(path):
+    with open(path, "rb") as f:
+        def token():
+            out = bytearray()
+            while True:
+                ch = f.read(1)
+                if not ch:
+                    return None
+                if ch == b"#":
+                    f.readline()
+                    continue
+                if ch.isspace():
+                    if out:
+                        return bytes(out)
+                    continue
+                out.extend(ch)
+
+        magic = token()
+        if magic not in (b"P5", b"P2"):
+            raise ValueError(f"不支持的 PGM 格式: {magic!r}")
+        width = int(token())
+        height = int(token())
+        maxval = int(token())
+        if maxval <= 0 or maxval > 255:
+            raise ValueError(f"不支持的 PGM maxval: {maxval}")
+        if magic == b"P5":
+            pixels = list(f.read(width * height))
+        else:
+            pixels = [int(token()) for _ in range(width * height)]
+        if len(pixels) != width * height:
+            raise ValueError("PGM 像素数据长度不匹配")
+        return width, height, pixels
+
+
+def load_occupancy_grid_from_yaml(path):
+    meta = _parse_map_yaml(path)
+    width, height, pixels = _read_pgm(meta["image"])
+    negate = meta["negate"]
+    occ_th = meta["occupied_thresh"]
+    free_th = meta["free_thresh"]
+    data = []
+    for y in range(height):
+        src_y = height - 1 - y
+        for x in range(width):
+            gray = pixels[src_y * width + x]
+            occ = gray / 255.0 if negate else (255 - gray) / 255.0
+            if occ > occ_th:
+                data.append(100)
+            elif occ < free_th:
+                data.append(0)
+            else:
+                data.append(-1)
+
+    grid = _MapObj()
+    grid.info = _MapObj()
+    grid.info.width = width
+    grid.info.height = height
+    grid.info.resolution = meta["resolution"]
+    grid.info.origin = _MapObj()
+    grid.info.origin.position = _MapObj()
+    grid.info.origin.position.x = meta["origin"][0]
+    grid.info.origin.position.y = meta["origin"][1]
+    grid.data = data
+    return grid
 
 
 # ============================================================
@@ -417,17 +545,21 @@ class RosWorker(QThread):
         self._pub_cmd.publish(t)
 
     def _pub_goal_slot(self, x, y, yaw):
-        g = PoseStamped()
-        g.header.frame_id = "map"
-        g.header.stamp = rospy.Time.now()
-        g.pose.position.x, g.pose.position.y = x, y
-        q = tf_tr.quaternion_from_euler(0, 0, yaw)
-        g.pose.orientation.x, g.pose.orientation.y = q[0], q[1]
-        g.pose.orientation.z, g.pose.orientation.w = q[2], q[3]
-        self._pub_goal.publish(g)
-        self._goal_pending = True
-        self._goal_was_active = False  # 新目标，还没进入 active 状态  # 标记正在等待导航完成
-        self.log_msg.emit(f"[ROS] 导航目标: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+        try:
+            g = PoseStamped()
+            g.header.frame_id = "map"
+            g.header.stamp = rospy.Time.now()
+            g.pose.position.x, g.pose.position.y = x, y
+            q = tf_tr.quaternion_from_euler(0, 0, yaw)
+            g.pose.orientation.x, g.pose.orientation.y = q[0], q[1]
+            g.pose.orientation.z, g.pose.orientation.w = q[2], q[3]
+            self._pub_goal.publish(g)
+            self._goal_pending = True
+            self._goal_was_active = False
+            self.log_msg.emit(f"[ROS] 导航目标已发布: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+            self.log_msg.emit(f"[ROS] 订阅者数量: {self._pub_goal.get_num_connections()}")
+        except Exception as e:
+            self.log_msg.emit(f"[ROS] 导航目标发布失败: {e}")
 
     def _pub_initpose_slot(self, x, y, yaw):
         p = PoseWithCovarianceStamped()
@@ -479,6 +611,12 @@ class RosWorker(QThread):
     def _cmd_vel_bridge_cb(self, msg):
         """把 move_base 输出的 cmd_vel 转发给主线程（再转发给 G1）"""
         self.nav_cmd_vel.emit(msg.linear.x, msg.linear.y, msg.angular.z)
+        # 调试日志（每秒打印一次，避免刷屏）
+        if not hasattr(self, '_cmd_vel_log_cnt'):
+            self._cmd_vel_log_cnt = 0
+        self._cmd_vel_log_cnt += 1
+        if self._cmd_vel_log_cnt % 20 == 1:  # 约每秒打印一次
+            self.log_msg.emit(f"[ROS] cmd_vel: vx={msg.linear.x:.3f}, vy={msg.linear.y:.3f}, wz={msg.angular.z:.3f}")
 
     def _map_cb(self, msg):
         self.log_msg.emit(f"[ROS] 收到地图: {msg.info.width}x{msg.info.height}")
@@ -550,6 +688,22 @@ class MapView(QGraphicsView):
         self._drag_start_scene = None  # 拖拽起点（场景坐标）
         self._drag_arrow = None  # 拖拽箭头
 
+    def _has_map(self):
+        return self._map_item is not None and self._res > 0 and self._width > 0 and self._height > 0
+
+    def _scene_to_map(self, sp):
+        if not self._has_map():
+            return None
+        sx, sy = sp.x(), sp.y()
+        if sx < 0 or sy < 0 or sx >= self._width or sy >= self._height:
+            return None
+        return sx * self._res + self._origin[0], sy * self._res + self._origin[1]
+
+    def _map_to_scene(self, x, y):
+        if self._res <= 0:
+            return None
+        return (x - self._origin[0]) / self._res, (y - self._origin[1]) / self._res
+
     def set_reloc_mode(self, on):
         self._reloc_mode = on
         if on:
@@ -607,8 +761,17 @@ class MapView(QGraphicsView):
         self._map_item.setTransform(transform)
         self._scene.addItem(self._map_item)
 
-        # 自动适应窗口
-        self.fitInView(self._scene.itemsBoundingRect(), Qt.KeepAspectRatio)
+        # 只在首次加载或地图尺寸变化时自动适应窗口，避免反复重置缩放
+        # 但重定位后需要重新适应（_force_fit_in_view 标志）
+        should_fit = False
+        if not hasattr(self, '_last_map_size') or self._last_map_size != (w, h):
+            should_fit = True
+            self._last_map_size = (w, h)
+        if hasattr(self, '_force_fit_in_view') and self._force_fit_in_view:
+            should_fit = True
+            self._force_fit_in_view = False
+        if should_fit:
+            self.fitInView(self._scene.itemsBoundingRect(), Qt.KeepAspectRatio)
 
     def update_robot(self, x, y, yaw):
         """更新机器人位置 — 三角箭头 + 发光效果"""
@@ -618,8 +781,10 @@ class MapView(QGraphicsView):
         if self._res <= 0:
             return
 
-        px = (x - self._origin[0]) / self._res
-        py = (y - self._origin[1]) / self._res
+        scene_pos = self._map_to_scene(x, y)
+        if scene_pos is None:
+            return
+        px, py = scene_pos
         items = []
 
         # 外圈发光
@@ -680,8 +845,10 @@ class MapView(QGraphicsView):
             self._scene.removeItem(item)
         self._wp_items.clear()
         for i, (name, x, y, *_) in enumerate(wps):
-            px = (x - self._origin[0]) / self._res
-            py = (y - self._origin[1]) / self._res
+            scene_pos = self._map_to_scene(x, y)
+            if scene_pos is None:
+                continue
+            px, py = scene_pos
             dot = self._scene.addEllipse(px - 5, py - 5, 10, 10,
                                            QPen(Qt.white, 1.5), QBrush(QColor("#ff6600")))
             txt = self._scene.addText(str(i + 1), QFont("Arial", 9, QFont.Bold))
@@ -692,14 +859,20 @@ class MapView(QGraphicsView):
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             sp = self.mapToScene(e.pos())
+            mp = self._scene_to_map(sp)
             if self._reloc_mode:
+                if mp is None:
+                    super().mousePressEvent(e)
+                    return
                 # 重定位模式：记录拖拽起点
                 self._drag_start_scene = sp
                 self._clear_drag_arrow()
             else:
+                if mp is None:
+                    super().mousePressEvent(e)
+                    return
                 # 普通模式：点击发送导航目标
-                mx = sp.x() * self._res + self._origin[0]
-                my = sp.y() * self._res + self._origin[1]
+                mx, my = mp
                 self.clicked.emit(mx, my)
         super().mousePressEvent(e)
 
@@ -731,9 +904,10 @@ class MapView(QGraphicsView):
                 self._drag_arrow = items
 
                 # 实时更新机器人预览位置
-                mx = start.x() * self._res + self._origin[0]
-                my = start.y() * self._res + self._origin[1]
-                self.update_robot(mx, my, yaw)
+                mp = self._scene_to_map(start)
+                if mp is not None:
+                    mx, my = mp
+                    self.update_robot(mx, my, yaw)
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
@@ -743,8 +917,13 @@ class MapView(QGraphicsView):
             dx = end.x() - start.x()
             dy = end.y() - start.y()
             # 起点 = 机器人位置（地图坐标）
-            mx = start.x() * self._res + self._origin[0]
-            my = start.y() * self._res + self._origin[1]
+            mp = self._scene_to_map(start)
+            if mp is None:
+                self._drag_start_scene = None
+                self._clear_drag_arrow()
+                super().mouseReleaseEvent(e)
+                return
+            mx, my = mp
             # 拖拽方向 = 机器人朝向
             yaw = math.atan2(dy, dx) if (abs(dx) > 2 or abs(dy) > 2) else 0.0
             self._drag_start_scene = None
@@ -825,6 +1004,7 @@ class WaypointDialog(QDialog):
 # ============================================================
 class MainWindow(QMainWindow):
     log_message = pyqtSignal(str)
+    remote_status_signal = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -863,13 +1043,22 @@ class MainWindow(QMainWindow):
         self._pose_timer = None
         self._teleop_active = False
         self._has_active_goal = False  # 是否有活跃的导航目标，防止启动时误触发
+        self._remote_goal_pending = False
+        self._remote_goal_was_active = False
+        self._remote_goal_target = None
+        self._remote_nav_running = False
         self._waypoints = []  # [(name, x, y, yaw, action, speech)]
         self._tour_running = False
         self._last_pose = (0.0, 0.0, 0.0)
         self._map_data = None
+        self._remote_status_timer = QTimer(self)
+        self._remote_status_timer.setInterval(800)
+        self._remote_status_timer.timeout.connect(self._poll_remote_status)
+        self._remote_status_busy = False
 
         self._init_ui()
         self.log_message.connect(self._append_log)
+        self.remote_status_signal.connect(self._on_remote_status)
         self._load_settings()
         self._status_ros.setText("ROS: 未启动")
 
@@ -2451,6 +2640,31 @@ class MainWindow(QMainWindow):
         map_yaml = self._edit_map.text().strip()
         pcd_path = self._edit_pcd.text().strip()
 
+        if self._g1_remote_mode and self._g1_remote:
+            try:
+                self._load_local_map_for_display()
+                self._g1_remote.nav_start()
+                self._remote_nav_running = True
+                self._nav_status_label.setText("导航: 本体运行中")
+                self._nav_status_label.setStyleSheet("font-weight: bold; color: #27ae60; padding: 4px 12px;")
+                self._btn_nav_start.setEnabled(False)
+                self._btn_nav_stop.setEnabled(True)
+                self._log("[导航] 已在 G1 本体启动（使用本体地图/PCD 默认路径）")
+                for delay in (500, 1500, 3000):
+                    QTimer.singleShot(delay, self._poll_remote_status)
+            except Exception as e:
+                QMessageBox.warning(self, "本体导航启动失败", str(e))
+                self._log(f"[导航] 本体启动失败: {e}")
+            return
+
+        # 重置地图缩放标志，允许导航启动后自动适应
+        if hasattr(self._map_view, '_last_map_size'):
+            del self._map_view._last_map_size
+
+        # 重置地图缩放标志，允许导航启动后自动适应
+        if hasattr(self._map_view, '_last_map_size'):
+            del self._map_view._last_map_size
+
         if not os.path.exists(map_yaml):
             QMessageBox.warning(self, "地图文件不存在", f"请选择有效的 2D 地图文件\n{map_yaml}")
             return
@@ -2521,6 +2735,21 @@ class MainWindow(QMainWindow):
             self._btn_nav_stop.setEnabled(False)
 
     def _on_nav_stop(self):
+        if self._g1_remote_mode and self._g1_remote:
+            try:
+                self._g1_remote.nav_stop()
+            except Exception as e:
+                self._log(f"[导航] 本体停止失败: {e}")
+            self._has_active_goal = False
+            self._remote_nav_running = False
+            self._remote_goal_pending = False
+            self._remote_goal_was_active = False
+            self._remote_goal_target = None
+            self._nav_status_label.setText("导航: 已停止")
+            self._nav_status_label.setStyleSheet("font-weight: bold; color: #aaa; padding: 4px 12px;")
+            self._btn_nav_start.setEnabled(True)
+            self._btn_nav_stop.setEnabled(False)
+            return
         if self._nav_proc:
             self._log("[导航] 停止中…")
             self._nav_proc.terminate()
@@ -2537,6 +2766,7 @@ class MainWindow(QMainWindow):
     def _on_g1_toggle(self):
         if self._g1_ready:
             self._arm_sdk_release()
+            self._remote_status_timer.stop()
             self._g1_ready = False
             self._arm_sdk_ready = False
             self._arm_sdk_pub = None
@@ -2566,6 +2796,11 @@ class MainWindow(QMainWindow):
                 self._g1_label.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px 10px; color: #27ae60;")
                 self._status_g1.setText("G1: 远程已连接")
                 self._log("[G1远程] 连接成功，本地 GUI 中文输入保持 PC 输入法")
+                self._load_local_map_for_display()
+                self._on_remote_status(status)
+                self._remote_status_timer.start()
+                for delay in (100, 500, 1200):
+                    QTimer.singleShot(delay, self._poll_remote_status)
             except Exception as e:
                 QMessageBox.warning(self, "G1 远程连接失败", str(e))
                 self._log(f"[G1远程] 连接失败: {e}")
@@ -2659,6 +2894,99 @@ class MainWindow(QMainWindow):
         self._map_view.set_map(occ_grid)
         self._map_view.update_waypoints(self._waypoints)
 
+    def _load_local_map_for_display(self):
+        map_yaml = self._edit_map.text().strip()
+        if not map_yaml:
+            return False
+        try:
+            occ_grid = load_occupancy_grid_from_yaml(map_yaml)
+            self._on_map(occ_grid)
+            self._status_ros.setText("地图: 本地文件")
+            self._log(f"[地图] 已加载本地显示地图: {map_yaml}")
+            return True
+        except Exception as e:
+            self._log(f"[地图] 本地地图加载失败: {e}")
+            return False
+
+    def _poll_remote_status(self):
+        if not (self._g1_remote_mode and self._g1_remote and self._g1_ready):
+            return
+        if self._remote_status_busy:
+            return
+        self._remote_status_busy = True
+
+        def worker():
+            try:
+                data = self._g1_remote.status().get("data", {})
+                self.remote_status_signal.emit(data)
+            except Exception as e:
+                self.log_message.emit(f"[G1远程] 状态更新失败: {e}")
+            finally:
+                self._remote_status_busy = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_remote_status(self, data):
+        pose = data.get("nav_pose") if isinstance(data, dict) else None
+        if pose:
+            try:
+                self._on_pose(float(pose["x"]), float(pose["y"]), float(pose["yaw"]))
+            except Exception:
+                pass
+        if isinstance(data, dict) and "nav_running" in data:
+            self._remote_nav_running = bool(data.get("nav_running"))
+            if self._g1_remote_mode:
+                if self._remote_nav_running:
+                    self._nav_status_label.setText("导航: 本体运行中")
+                    self._nav_status_label.setStyleSheet("font-weight: bold; color: #27ae60; padding: 4px 12px;")
+                    self._btn_nav_start.setEnabled(False)
+                    self._btn_nav_stop.setEnabled(True)
+                else:
+                    self._nav_status_label.setText("导航: 未启动")
+                    self._nav_status_label.setStyleSheet("font-weight: bold; color: #aaa; padding: 4px 12px;")
+                    self._btn_nav_start.setEnabled(True)
+                    self._btn_nav_stop.setEnabled(False)
+        nav = data.get("nav") if isinstance(data, dict) else None
+        if nav:
+            text = {
+                "active": "导航中",
+                "succeeded": "已到达 ✓",
+                "aborted": "失败 ✗",
+                "goal_sent": "目标已发送",
+                "reloc_sent": "重定位已发送",
+                "running": "运行中",
+                "starting": "启动中",
+                "stopped": "已停止",
+            }.get(nav, str(nav))
+            self._on_nav_status(text)
+            if self._g1_remote_mode and self._remote_goal_pending:
+                last_goal = data.get("nav_last_goal") if isinstance(data, dict) else None
+                goal_matches = True
+                if self._remote_goal_target and isinstance(last_goal, dict):
+                    try:
+                        gx, gy, gyaw = self._remote_goal_target
+                        goal_matches = (
+                            abs(float(last_goal.get("x", 1e9)) - gx) < 0.02
+                            and abs(float(last_goal.get("y", 1e9)) - gy) < 0.02
+                            and abs(float(last_goal.get("yaw", 1e9)) - gyaw) < 0.2
+                        )
+                    except Exception:
+                        goal_matches = False
+                if nav == "active":
+                    self._remote_goal_was_active = True
+                elif nav == "succeeded" and goal_matches:
+                    self._remote_goal_pending = False
+                    self._remote_goal_was_active = False
+                    self._remote_goal_target = None
+                    self._log("[导航] 本体到达目标")
+                    self._on_goal_done(True)
+                elif nav in ("aborted", "rejected", "preempted", "recalled") and goal_matches:
+                    self._remote_goal_pending = False
+                    self._remote_goal_was_active = False
+                    self._remote_goal_target = None
+                    self._log(f"[导航] 本体目标失败: {nav}")
+                    self._on_goal_done(False)
+
     def _on_nav_status(self, text):
         self._nav_state_label.setText(text)
         color = {"已到达": "#27ae60", "失败": "#c0392b", "导航中": "#f39c12"}.get(text, "#aaa")
@@ -2669,12 +2997,66 @@ class MainWindow(QMainWindow):
         if self._tour_running:
             self._tour_next_step()
 
+    def _send_nav_goal(self, x, y, yaw, label="[导航] 发送目标"):
+        if self._g1_remote_mode and self._g1_remote and not self._remote_nav_running:
+            self._log("[导航] 请先点击“启动导航”，等待本体运行中后再发送目标")
+            QMessageBox.warning(self, "导航未启动", "请先点击“启动导航”，等待本体运行中后再发送目标。")
+            return
+        self._has_active_goal = True
+        if self._g1_remote_mode and self._g1_remote:
+            self._remote_goal_pending = True
+            self._remote_goal_was_active = False
+            self._remote_goal_target = (float(x), float(y), float(yaw))
+            self._log(f"{label}: ({x:.2f}, {y:.2f})")
+            def worker():
+                try:
+                    data = self._g1_remote.nav_goal(x, y, yaw).get("data", {})
+                    self.remote_status_signal.emit(data)
+                except Exception as e:
+                    self._has_active_goal = False
+                    self._remote_goal_pending = False
+                    self._remote_goal_was_active = False
+                    self._remote_goal_target = None
+                    self.log_message.emit(f"[导航] 本体目标下发失败: {e}")
+            threading.Thread(target=worker, daemon=True).start()
+            return
+        if self._ros_worker:
+            self._ros_worker.send_goal(x, y, yaw)
+            self._log(f"{label}: ({x:.2f}, {y:.2f})")
+
+    def _send_reloc(self, x, y, yaw, label="[重定位] 设置位姿"):
+        if self._g1_remote_mode and self._g1_remote:
+            self._log(f"{label}: ({x:.2f}, {y:.2f}) {math.degrees(yaw):.0f}°")
+            def worker():
+                try:
+                    data = self._g1_remote.nav_reloc(x, y, yaw).get("data", {})
+                    self.remote_status_signal.emit(data)
+                    for _ in range(20):
+                        time.sleep(1.0)
+                        data = self._g1_remote.status().get("data", {})
+                        self.remote_status_signal.emit(data)
+                        if data.get("nav_pose") and not data.get("nav_reloc_busy"):
+                            break
+                except Exception as e:
+                    self.log_message.emit(f"[重定位] 本体下发失败: {e}")
+            threading.Thread(target=worker, daemon=True).start()
+            return True
+        return False
+
     def _on_nav_cmd_vel(self, vx, vy, wz):
         """将 move_base 的 cmd_vel 转发给 G1（仅在有活跃目标时）"""
-        if not self._g1_ready or not self._g1_loco:
+        if not self._g1_ready:
             return
         if not self._has_active_goal:
             return  # 没有导航目标时不转发，防止启动时误触发
+
+        # 调试日志
+        if not hasattr(self, '_nav_cmd_log_cnt'):
+            self._nav_cmd_log_cnt = 0
+        self._nav_cmd_log_cnt += 1
+        if self._nav_cmd_log_cnt % 20 == 1:
+            self._log(f"[G1] 收到cmd_vel: vx={vx:.3f}, vy={vy:.3f}, wz={wz:.3f}")
+
         try:
             if self._g1_remote_mode and self._g1_remote:
                 if abs(vx) < 0.001 and abs(vy) < 0.001 and abs(wz) < 0.001:
@@ -2682,12 +3064,14 @@ class MainWindow(QMainWindow):
                 else:
                     self._g1_remote.move(vx, vy, wz, continuous=True)
                 return
+            if not self._g1_loco:
+                return
             if abs(vx) < 0.001 and abs(vy) < 0.001 and abs(wz) < 0.001:
                 self._g1_loco.StopMove()
             else:
                 self._g1_loco.Move(vx, vy, wz, continous_move=True)
-        except Exception:
-            pass
+        except Exception as e:
+            self._log(f"[G1] cmd_vel转发失败: {e}")
 
     # ---- 重定位 ----
     _reloc_mode = False
@@ -2737,16 +3121,15 @@ class MainWindow(QMainWindow):
     def _on_map_nav(self, mx, my):
         """点击地图普通模式 → 发送导航目标"""
         _, _, yaw = self._last_pose
-        if self._ros_worker:
-            self._has_active_goal = True
-            self._ros_worker.send_goal(mx, my, yaw)
-            self._log(f"[导航] 点击目标: ({mx:.2f}, {my:.2f})")
+        self._send_nav_goal(mx, my, yaw, "[导航] 点击目标")
 
     def _on_drag_reloc(self, mx, my, yaw):
         """拖拽重定位：起点=位置，方向=朝向，自动调 ICP"""
         self._reloc_x.setText(f"{mx:.2f}")
         self._reloc_y.setText(f"{my:.2f}")
         self._reloc_yaw_slider.setValue(int(math.degrees(yaw)))
+        if self._send_reloc(mx, my, yaw, "[重定位] 拖拽 ICP"):
+            return
         if self._ros_worker and self._ros_worker._reloc_srv:
             self._ros_worker.request_reloc.emit(mx, my, yaw)
             self._log(f"[重定位] 拖拽 ICP: ({mx:.2f}, {my:.2f}) 朝向: {math.degrees(yaw):.0f}°")
@@ -2759,6 +3142,8 @@ class MainWindow(QMainWindow):
         yaw = math.radians(self._reloc_yaw_slider.value())
         self._reloc_x.setText(f"{mx:.2f}")
         self._reloc_y.setText(f"{my:.2f}")
+        if self._send_reloc(mx, my, yaw, "[重定位] ICP 重定位"):
+            return
         # 调用 ICP 重定位服务
         if self._ros_worker and self._ros_worker._reloc_srv:
             self._ros_worker.request_reloc.emit(mx, my, yaw)
@@ -2780,6 +3165,8 @@ class MainWindow(QMainWindow):
             x = float(self._reloc_x.text())
             y = float(self._reloc_y.text())
             yaw = math.radians(self._reloc_yaw_slider.value())
+            if self._send_reloc(x, y, yaw, "[重定位] ICP 重定位"):
+                return
             # 优先调用 ICP 服务（自动对齐点云）
             if self._ros_worker and self._ros_worker._reloc_srv:
                 self._ros_worker.request_reloc.emit(x, y, yaw)
@@ -2908,15 +3295,21 @@ class MainWindow(QMainWindow):
                 self._log(f"[G1] 站起失败: {e}")
 
     def _g1_speak(self, text):
-        if self._g1_ready and text.strip():
+        text = (text or "").strip()
+        if not (self._g1_ready and text):
+            return
+        self._log(f"[语音] 播报: {text}")
+
+        def worker():
             try:
-                self._log(f"[语音] 播报: {text}")
                 if self._g1_remote_mode and self._g1_remote:
-                    self._g1_remote.speak(text.strip(), 0)
+                    self._g1_remote.speak(text, 0)
                     return
-                self._g1_audio.TtsMaker(text.strip(), 0) #0女声 1男声
+                self._g1_audio.TtsMaker(text, 0) #0女声 1男声
             except Exception as e:
-                self._log(f"[语音] 失败: {e}")
+                self.log_message.emit(f"[语音] 失败: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---- 灵巧手控制 ----
     def _init_hand_dds(self, net_if):
@@ -3080,10 +3473,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先选择一个航点")
             return
         _, x, y, yaw, _, _ = self._waypoints[row]
-        if self._ros_worker:
-            self._has_active_goal = True
-            self._ros_worker.send_goal(x, y, yaw)
-        self._log(f"[导航] 发送目标: ({x:.2f}, {y:.2f})")
+        self._send_nav_goal(x, y, yaw)
 
     def _wp_save(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -3146,6 +3536,10 @@ class MainWindow(QMainWindow):
     def _tour_toggle(self):
         if self._tour_running:
             return
+        if self._g1_remote_mode and self._g1_remote and not self._remote_nav_running:
+            QMessageBox.warning(self, "导航未启动", "请先点击“启动导航”，等待本体运行中后再开始多点巡航。")
+            self._log("[巡航] 未启动：请先启动导航")
+            return
         if len(self._waypoints) < 1:
             QMessageBox.warning(self, "提示", "请先添加航点")
             return
@@ -3161,9 +3555,7 @@ class MainWindow(QMainWindow):
         self._tour_pb.setValue(1)
         self._tour_label.setText(f"→ {name}")
         self._log(f"[巡航] [1/{len(self._waypoints)}] {name}")
-        if self._ros_worker:
-            self._has_active_goal = True
-            self._ros_worker.send_goal(x, y, yaw)
+        self._send_nav_goal(x, y, yaw)
 
     def _tour_next_step(self):
         """由导航完成或超时触发下一步"""
@@ -3189,9 +3581,7 @@ class MainWindow(QMainWindow):
         self._tour_label.setText(f"→ {name}")
         self._log(f"[巡航] [{self._tour_idx + 1}/{len(self._waypoints)}] {name}")
 
-        if self._ros_worker:
-            self._has_active_goal = True
-            self._ros_worker.send_goal(x, y, yaw)
+        self._send_nav_goal(x, y, yaw)
 
         self._tour_idx += 1
 

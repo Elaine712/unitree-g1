@@ -103,6 +103,7 @@ target_link_libraries(body2any_pointcloud
 )
 
 add_executable(livox2velodyne src/livox2velodyne.cpp )
+add_dependencies(livox2velodyne ${catkin_EXPORTED_TARGETS})
 target_link_libraries(livox2velodyne ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES})
 target_include_directories(livox2velodyne PRIVATE ${PYTHON_INCLUDE_DIRS})
 
