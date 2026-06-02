@@ -7,9 +7,13 @@ BASE="$(cd "$(dirname "$0")" && pwd)"
 RUNTIME_DIR="${BASE}/.runtime"
 mkdir -p "$RUNTIME_DIR"
 
-export HONGTU_G1_NET_IF="${HONGTU_G1_NET_IF:-auto}"
+# G1 本体上的 DDS/雷达链路固定走 192.168.123.x 内网，HTTP 仍监听 0.0.0.0
+# 这样 PC 可经 WiFi 访问后台，但本体控制和导航不会误选 wlan0。
+export HONGTU_G1_NET_IF="${HONGTU_G1_NET_IF:-eth0}"
 export HONGTU_SERVICE_HOST="${HONGTU_SERVICE_HOST:-0.0.0.0}"
 export HONGTU_SERVICE_PORT="${HONGTU_SERVICE_PORT:-5055}"
+export HONGTU_NAV_CMD_BRIDGE="${HONGTU_NAV_CMD_BRIDGE:-0}"
+export HONGTU_PAUSE_CONTROL_DURING_NAV="${HONGTU_PAUSE_CONTROL_DURING_NAV:-1}"
 export CYCLONEDDS_HOME="${CYCLONEDDS_HOME:-/home/unitree/cyclonedds_ws/install/cyclonedds}"
 export PYTHONPATH="${RUNTIME_DIR}/python:${BASE}/unitree_sdk2_python:${BASE}/inspire_hand:${PYTHONPATH}"
 export LD_LIBRARY_PATH="${CYCLONEDDS_HOME}/lib:/usr/local/athena/third_party/arm64/lib/unitree_sdk2:${LD_LIBRARY_PATH}"

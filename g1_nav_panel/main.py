@@ -3010,8 +3010,24 @@ class MainWindow(QMainWindow):
             self._log(f"{label}: ({x:.2f}, {y:.2f})")
             def worker():
                 try:
+                    for _ in range(20):
+                        data = self._g1_remote.status().get("data", {})
+                        self.remote_status_signal.emit(data)
+                        if not data.get("nav_reloc_busy"):
+                            break
+                        self.log_message.emit("[导航] 等待重定位完成后下发目标...")
+                        time.sleep(1.0)
+                    self.log_message.emit("[导航] 正在下发本体目标...")
                     data = self._g1_remote.nav_goal(x, y, yaw).get("data", {})
                     self.remote_status_signal.emit(data)
+                    self.log_message.emit("[导航] 本体目标已下发")
+                    for _ in range(30):
+                        time.sleep(1.0)
+                        data = self._g1_remote.status().get("data", {})
+                        self.remote_status_signal.emit(data)
+                        nav = data.get("nav") if isinstance(data, dict) else None
+                        if nav in ("succeeded", "aborted", "rejected", "preempted", "recalled", "stopped"):
+                            break
                 except Exception as e:
                     self._has_active_goal = False
                     self._remote_goal_pending = False

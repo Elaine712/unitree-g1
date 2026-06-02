@@ -220,6 +220,7 @@ class G1Robot:
         self.nav_goal_pub = None
         self.nav_initpose_pub = None
         self.nav_clear_costmaps = None
+        self.control_paused_for_nav = False
 
         self.arm_ready = False
         self.arm_active = False
@@ -337,6 +338,40 @@ class G1Robot:
         env["ROS_MASTER_URI"] = env.get("ROS_MASTER_URI", "http://localhost:11311")
         return env
 
+    def _pause_control_for_nav(self):
+        if os.environ.get("HONGTU_PAUSE_CONTROL_DURING_NAV", "1").lower() in ("0", "false", "no"):
+            return
+        try:
+            subprocess.run(
+                ["bash", "-lc", "source /opt/ros/noetic/setup.bash 2>/dev/null; rosnode kill /control >/dev/null 2>&1 || true"],
+                check=False,
+                timeout=3,
+            )
+            subprocess.run(["pkill", "-x", "control"], check=False)
+            subprocess.run(["pkill", "-f", "/home/unitree/unitree_robot_g1/modules/control/bin/./control"], check=False)
+            subprocess.run(["pkill", "-f", "/home/unitree/unitree_robot_g1/modules/control/bin/control"], check=False)
+            subprocess.run(["pkill", "-f", "cd /home/unitree/unitree_robot_g1/scripts;./control.sh"], check=False)
+            subprocess.run(["pkill", "-f", "/bin/bash ./control.sh"], check=False)
+            self.control_paused_for_nav = True
+            self.log("[导航] 已暂停本体 /control 零速度发布，避免打断 move_base")
+            time.sleep(0.5)
+        except Exception as e:
+            self.log(f"[导航] 暂停 /control 失败: {e}")
+
+    def _resume_control_after_nav(self):
+        if not self.control_paused_for_nav:
+            return
+        self.control_paused_for_nav = False
+        try:
+            subprocess.Popen(
+                ["bash", "-lc", "cd /home/unitree/unitree_robot_g1/scripts && nohup ./control.sh >/tmp/hongtu_control.log 2>&1 &"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.log("[导航] 已恢复本体 /control")
+        except Exception as e:
+            self.log(f"[导航] 恢复 /control 失败: {e}")
+
     def nav_start(self, map_yaml=None, pcd_path=None):
         with self.lock:
             if self.nav_proc and self.nav_proc.poll() is None:
@@ -344,6 +379,7 @@ class G1Robot:
                 self._start_nav_bridge()
                 return
             self._cleanup_stale_nav_processes()
+            self._pause_control_for_nav()
             map_yaml = map_yaml or os.environ.get(
                 "HONGTU_MAP_YAML",
                 os.path.join(BASE, ".runtime", "maps", "G1map.yaml"),
@@ -436,6 +472,7 @@ class G1Robot:
                 except Exception:
                     pass
             self._cleanup_stale_nav_processes()
+            self._resume_control_after_nav()
 
     def _start_nav_bridge(self):
         if self.nav_bridge_started:
@@ -496,11 +533,16 @@ class G1Robot:
                     "stamp": time.time(),
                 }
 
-            rospy.Subscriber("/cmd_vel", Twist, cmd_cb, queue_size=10)
+            nav_cmd_bridge = os.environ.get("HONGTU_NAV_CMD_BRIDGE", "0").lower() in ("1", "true", "yes")
+            if nav_cmd_bridge:
+                # Optional fallback for systems without the native /g1_robot cmd_vel bridge.
+                rospy.Subscriber("/cmd_vel_smooth", Twist, cmd_cb, queue_size=10)
+                self.log("[导航] cmd_vel_smooth DDS 桥接已启动")
+            else:
+                self.log("[导航] 使用本体 /g1_robot 原生 cmd_vel 控制，后台不重复转发速度")
             rospy.Subscriber("/move_base/status", GoalStatusArray, status_cb, queue_size=10)
             rospy.Subscriber("/slam_odom", Odometry, odom_cb, queue_size=10)
             self.nav_ros_ready.set()
-            self.log("[导航] cmd_vel 桥接已启动")
             rospy.spin()
         except Exception as e:
             self.log(f"[导航] cmd_vel 桥接失败: {e}")
