@@ -5,7 +5,7 @@ set -e
 
 BASE="$(cd "$(dirname "$0")" && pwd)"
 G1_WIRED_HOST="${G1_WIRED_HOST:-192.168.123.164}"
-G1_WIFI_HOST="${G1_WIFI_HOST:-192.168.1.24}"
+G1_WIFI_HOST="${G1_WIFI_HOST:-}"
 G1_BACKEND_HOST="${G1_BACKEND_HOST:-${G1_HOST:-}}"
 G1_USER="${G1_USER:-unitree}"
 G1_BACKEND_PORT="${G1_BACKEND_PORT:-5055}"
@@ -103,7 +103,8 @@ discover_backend() {
         echo "[pc-gui] 指定的 G1_BACKEND_HOST 不可访问: $G1_BACKEND_HOST" >&2
         return 1
     fi
-    for host in "$G1_WIRED_HOST" "$G1_WIFI_HOST"; do
+    for host in "$G1_WIRED_HOST" "$G1_WIFI_HOST" "192.168.1.24"; do
+        [ -z "$host" ] && continue
         echo "[pc-gui] checking backend ${host}:${G1_BACKEND_PORT}..." >&2
         if can_http "$host"; then
             BACKEND_ADDR="${host}:${G1_BACKEND_PORT}"
