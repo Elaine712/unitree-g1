@@ -60,7 +60,7 @@ class G1RemoteClient:
             "vy": float(vy),
             "wz": float(wz),
             "continuous": bool(continuous),
-        })
+        }, timeout=0.35 if continuous else 0.8)
 
     def stop(self):
         return self._request("POST", "/api/stop", {})

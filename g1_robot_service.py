@@ -203,6 +203,11 @@ class G1Robot:
         self.tts_index = 1
         self.last_move_time = 0.0
         self.moving = False
+        self.teleop_target = (0.0, 0.0, 0.0)
+        self.teleop_continuous = False
+        self.teleop_stop_event = threading.Event()
+        self.teleop_thread = threading.Thread(target=self._teleop_loop, daemon=True)
+        self.teleop_thread.start()
         self.hand_ready = False
         self.hand_pub_l = None
         self.hand_pub_r = None
@@ -822,16 +827,40 @@ class G1Robot:
             vx, vy, wz = float(vx), float(vy), float(wz)
             self.last_move_time = time.time()
             self.moving = abs(vx) > 1e-4 or abs(vy) > 1e-4 or abs(wz) > 1e-4
-            if self.moving:
+            self.teleop_target = (vx, vy, wz)
+            self.teleop_continuous = bool(continuous and self.moving)
+            if self.moving and not self.teleop_continuous:
                 self.loco.Move(vx, vy, wz, continous_move=bool(continuous))
-            else:
+            elif not self.moving:
                 self.loco.StopMove()
 
     def stop(self):
         with self.lock:
             self._require_ready()
             self.moving = False
+            self.teleop_target = (0.0, 0.0, 0.0)
+            self.teleop_continuous = False
             self.loco.StopMove()
+
+    def _teleop_loop(self):
+        interval = float(os.environ.get("HONGTU_TELEOP_DT", "0.05"))
+        timeout = float(os.environ.get("HONGTU_TELEOP_TIMEOUT", "0.45"))
+        while not self.teleop_stop_event.is_set():
+            time.sleep(interval)
+            try:
+                with self.lock:
+                    if not self.ready or not self.teleop_continuous:
+                        continue
+                    vx, vy, wz = self.teleop_target
+                    if time.time() - self.last_move_time > timeout:
+                        self.moving = False
+                        self.teleop_target = (0.0, 0.0, 0.0)
+                        self.teleop_continuous = False
+                        self.loco.StopMove()
+                        continue
+                    self.loco.Move(vx, vy, wz, continous_move=True)
+            except Exception:
+                pass
 
     def stand(self):
         with self.lock:
@@ -1106,6 +1135,72 @@ def watchdog(robot, timeout):
             robot.log(f"[安全] watchdog 异常: {e}")
 
 
+def _parse_simple_yaml(path):
+    values = {}
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.split("#", 1)[0].strip()
+            if not line or ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            values[k.strip()] = v.strip().strip("'\"")
+    return values
+
+
+def _read_pgm(path):
+    with open(path, "rb") as f:
+        def token():
+            out = bytearray()
+            while True:
+                ch = f.read(1)
+                if not ch:
+                    return None
+                if ch == b"#":
+                    f.readline()
+                    continue
+                if ch.isspace():
+                    if out:
+                        return bytes(out)
+                    continue
+                out.extend(ch)
+
+        magic = token()
+        if magic not in (b"P5", b"P2"):
+            raise ValueError(f"不支持的地图格式: {magic!r}")
+        w, h, maxval = int(token()), int(token()), int(token())
+        if maxval <= 0 or maxval > 255:
+            raise ValueError(f"不支持的 PGM maxval: {maxval}")
+        if magic == b"P5":
+            pixels = list(f.read(w * h))
+        else:
+            pixels = [int(token()) for _ in range(w * h)]
+        if len(pixels) != w * h:
+            raise ValueError("PGM 像素数据长度不匹配")
+        return w, h, pixels
+
+
+def load_web_map():
+    yaml_path = os.environ.get("HONGTU_MAP_YAML", os.path.join(BASE, ".runtime", "maps", "G1map.yaml"))
+    meta = _parse_simple_yaml(yaml_path)
+    image = meta.get("image")
+    if not image:
+        raise ValueError("地图 YAML 缺少 image 字段")
+    if not os.path.isabs(image):
+        image = os.path.abspath(os.path.join(os.path.dirname(yaml_path), image))
+    w, h, pixels = _read_pgm(image)
+    origin = [float(x.strip()) for x in meta.get("origin", "[0,0,0]").strip("[]").split(",") if x.strip()]
+    while len(origin) < 3:
+        origin.append(0.0)
+    return {
+        "width": w,
+        "height": h,
+        "resolution": float(meta.get("resolution", 0.05)),
+        "origin": origin[:3],
+        "pixels": pixels,
+        "yaml": yaml_path,
+    }
+
+
 INDEX_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1128,7 +1223,7 @@ INDEX_HTML = r"""<!doctype html>
     textarea{resize:vertical}.row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.row>*{flex:1}.tight button{min-width:76px}.muted{font-size:12px;color:var(--muted)}
     .pad{display:grid;grid-template-columns:80px 80px 80px;gap:6px;justify-content:center;align-items:center}.pad button{height:48px;margin:0}.pad .wide{grid-column:1/4}
     .swatch{width:42px;height:32px;min-width:42px;border-radius:4px}.sl{display:grid;grid-template-columns:72px 1fr 52px;gap:8px;align-items:center;margin:5px 0}.sl span{font-size:12px;color:var(--muted)}input[type=range]{accent-color:var(--accent);padding:0}
-    pre{height:210px;overflow:auto;white-space:pre-wrap;background:#0d1117;border:1px solid var(--line);border-radius:4px;padding:10px;color:#c0c0d0}.mapbox{height:420px;display:flex;align-items:center;justify-content:center;background:#0d1117;border:1px dashed var(--line);border-radius:4px;color:#64748b;text-align:center;padding:20px}
+    pre{height:210px;overflow:auto;white-space:pre-wrap;background:#0d1117;border:1px solid var(--line);border-radius:4px;padding:10px;color:#c0c0d0}.mapbox{height:460px;background:#0d1117;border:1px solid var(--line);border-radius:4px;position:relative;overflow:hidden}.mapbox canvas{width:100%;height:100%;display:block}.maphint{position:absolute;left:8px;bottom:8px;background:rgba(0,0,0,.55);padding:4px 7px;border-radius:4px;color:#cbd5e1;font-size:12px}.wp-list{max-height:150px;overflow:auto;background:#0d1117;border:1px solid var(--line);border-radius:4px;padding:6px;font-size:12px}
     @media(max-width:760px){header{align-items:flex-start;flex-wrap:wrap}.tabs{top:78px}.grid{grid-template-columns:1fr}.row>*{min-width:130px}.pad{grid-template-columns:1fr 1fr 1fr}}
   </style>
 </head>
@@ -1148,8 +1243,13 @@ INDEX_HTML = r"""<!doctype html>
         <section><h2>导航</h2>
           <div class="row tight"><button class="ok" onclick="cmd('/api/nav/start')">启动导航</button><button class="danger" onclick="cmd('/api/nav/stop')">停止导航</button><button onclick="poll()">刷新状态</button></div>
           <div class="row"><input id="goalX" type="number" step="0.01" placeholder="目标 X"><input id="goalY" type="number" step="0.01" placeholder="目标 Y"><input id="goalYaw" type="number" step="1" placeholder="朝向 °"></div>
-          <div class="row tight"><button onclick="navGoal()">发送导航目标</button><button onclick="navReloc()">重定位</button></div>
-          <p class="muted">网页端可启动 G1 本体导航、发送目标点和重定位。地图可视化仍建议使用 PC GUI。</p>
+          <div class="row tight"><button onclick="navGoal()">发送导航目标</button><button onclick="navReloc()">重定位</button><button onclick="addWaypoint()">添加航点</button></div>
+          <div class="mapbox"><canvas id="mapCanvas"></canvas><div class="maphint">点击地图填入目标点，机器人位置随状态刷新</div></div>
+        </section>
+        <section><h2>航点</h2>
+          <div class="row"><input id="wpFile" type="file" accept=".json,application/json"><button onclick="startCruise()">开始巡航</button><button onclick="stopCruise()">停止巡航</button></div>
+          <div id="wpList" class="wp-list">未加载航点</div>
+          <p class="muted">支持 PC GUI 导出的 JSON；也可在地图点击目标后添加航点。</p>
         </section>
         <section><h2>遥控</h2>
           <div class="row"><label>线速度<input id="lin" type="range" min="0" max="100" value="30"></label><label>角速度<input id="ang" type="range" min="0" max="100" value="50"></label></div>
@@ -1187,7 +1287,7 @@ const leds=[["红",255,0,0,"#ff3333"],["绿",0,255,0,"#33cc33"],["蓝",0,0,255,"
 const armNames=["左肩前后","左肩左右","左肩旋转","左肘","左腕旋转","左腕俯仰","左腕偏航","右肩前后","右肩左右","右肩旋转","右肘","右腕旋转","右腕俯仰","右腕偏航"];
 const armRanges=[[-2,2],[-1.5,1.5],[-2.5,2.5],[-2.5,3],[-1.5,1.5],[-1,1],[-1,1],[-2,2],[-1.5,1.5],[-2.5,2.5],[-2.5,3],[-1.5,1.5],[-1,1],[-1,1]];
 const fingerNames=["小指","无名指","中指","食指","拇指屈","拇指旋"];
-let arm=Array(14).fill(0), hand=Array(6).fill(500), statusData={};
+let arm=Array(14).fill(0), hand=Array(6).fill(500), statusData={}, webMap=null, waypoints=[], cruise=false, cruiseIndex=0;
 tabs.innerHTML=tabDefs.map((t,i)=>`<button class="tab-btn ${i?'':'active'}" onclick="showTab('${t[0]}',this)">${t[1]}</button>`).join("");
 commonActions.innerHTML=common.map(([a,c])=>`<button onclick="action('${a}')">${c}</button>`).join("");
 allActions.innerHTML=common.map(([a,c])=>`<button onclick="action('${a}')">${a}</button>`).join("");
@@ -1196,13 +1296,28 @@ leds.innerHTML=leds.map(([n,r,g,b,c])=>`<button class="swatch" style="background
 hands.innerHTML=presets.map(p=>`<button onclick="handPreset('${p}')">${p}</button>`).join("");
 armSliders.innerHTML=armNames.map((n,i)=>`<div class="sl"><span>${n}</span><input id="arm${i}" type="range" min="${armRanges[i][0]*100}" max="${armRanges[i][1]*100}" value="0" oninput="setArm(${i},this.value/100)"><span id="armv${i}">0.00</span></div>`).join("");
 handSliders.innerHTML=fingerNames.map((n,i)=>`<div class="sl"><span>${n}</span><input id="hand${i}" type="range" min="0" max="1000" value="500" oninput="setHand(${i},+this.value)"><span id="handv${i}">500</span></div>`).join("");
-document.querySelectorAll("[data-move]").forEach(b=>{let v=b.dataset.move.split(",").map(Number);["mousedown","touchstart"].forEach(e=>b.addEventListener(e,ev=>{ev.preventDefault();move(v[0],v[1],v[2])}));["mouseup","mouseleave","touchend","touchcancel"].forEach(e=>b.addEventListener(e,ev=>{ev.preventDefault();stop()}));});
+document.querySelectorAll("[data-move]").forEach(b=>{
+  let v=b.dataset.move.split(",").map(Number), hold=false, timer=null, loop=null;
+  function down(ev){ev.preventDefault();hold=false;timer=setTimeout(()=>{hold=true;move(v[0],v[1],v[2],true);loop=setInterval(()=>move(v[0],v[1],v[2],true),180)},220)}
+  function up(ev){ev.preventDefault();clearTimeout(timer);clearInterval(loop);if(hold){stop()}else{stepMove(v[0],v[1],v[2])}}
+  ["mousedown","touchstart","pointerdown"].forEach(e=>b.addEventListener(e,down));
+  ["mouseup","mouseleave","touchend","touchcancel","pointerup","pointercancel"].forEach(e=>b.addEventListener(e,up));
+});
+wpFile.addEventListener("change",loadWaypointsFile);
 function showTab(id,btn){document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));document.getElementById(id).classList.add("active");document.querySelectorAll(".tab-btn").forEach(x=>x.classList.remove("active"));btn.classList.add("active")}
 function add(s){log.textContent=(new Date().toLocaleTimeString()+" "+s+"\n"+log.textContent).slice(0,6000)}
 async function cmd(path,data={}){try{let r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});let j=await r.json();add((j.ok?"OK ":"ERR ")+path+" "+JSON.stringify(j.data||j.error||{}));await poll();return j}catch(e){add("失败 "+path+" "+e);return {ok:false,error:String(e)}}}
-function move(x,y,z){let lin=+document.getElementById("lin").value/100,ang=+document.getElementById("ang").value/100;cmd("/api/move",{vx:x*lin,vy:y*lin,wz:z*ang,continuous:false})}
+function move(x,y,z,continuous=false){let lin=+document.getElementById("lin").value/100,ang=+document.getElementById("ang").value/100;return cmd("/api/move",{vx:x*lin,vy:y*lin,wz:z*ang,continuous})}
+function stepMove(x,y,z){move(x,y,z,true);setTimeout(stop,360)}
 function stop(){cmd("/api/stop")}function fsm(id){cmd("/api/fsm",{id})}function action(name){cmd("/api/coordinated",{name})}function speak(text){cmd("/api/speak",{text:text||""})}
 function yawRad(){return (+goalYaw.value||0)*Math.PI/180}function navGoal(){cmd("/api/nav/goal",{x:+goalX.value||0,y:+goalY.value||0,yaw:yawRad()})}function navReloc(){cmd("/api/nav/reloc",{x:+goalX.value||0,y:+goalY.value||0,yaw:yawRad()})}
+function addWaypoint(){let wp={name:"航点"+(waypoints.length+1),x:+goalX.value||0,y:+goalY.value||0,yaw:yawRad()};waypoints.push(wp);renderWaypoints()}
+async function loadWaypointsFile(){let f=wpFile.files&&wpFile.files[0];if(!f)return;let txt=await f.text();let data=JSON.parse(txt);let arr=Array.isArray(data)?data:(data.waypoints||data.points||[]);waypoints=arr.map((w,i)=>({name:w.name||w.label||("航点"+(i+1)),x:+(w.x??w[1]??0),y:+(w.y??w[2]??0),yaw:+(w.yaw??w[3]??0)}));renderWaypoints();add("航点加载 "+waypoints.length+" 个")}
+function renderWaypoints(){wpList.innerHTML=waypoints.length?waypoints.map((w,i)=>`<div><button onclick="sendWaypoint(${i})">${i+1}</button> ${w.name} (${w.x.toFixed(2)}, ${w.y.toFixed(2)})</div>`).join(""):"未加载航点";drawMap()}
+function sendWaypoint(i){let w=waypoints[i];if(!w)return;goalX.value=w.x.toFixed(2);goalY.value=w.y.toFixed(2);goalYaw.value=Math.round((w.yaw||0)*180/Math.PI);return cmd("/api/nav/goal",{x:w.x,y:w.y,yaw:w.yaw||0})}
+async function waitNavDone(timeout=180000){let end=Date.now()+timeout;while(cruise&&Date.now()<end){await new Promise(r=>setTimeout(r,1200));await poll();let n=statusData.nav;if(["succeeded","aborted","rejected","preempted","recalled","stopped"].includes(n))return n}return "timeout"}
+async function startCruise(){if(!waypoints.length)return add("未加载航点");cruise=true;cruiseIndex=0;while(cruise&&cruiseIndex<waypoints.length){add("巡航 "+(cruiseIndex+1)+"/"+waypoints.length);await sendWaypoint(cruiseIndex++);let n=await waitNavDone();add("航点结果 "+n);if(n!=="succeeded")break}cruise=false}
+function stopCruise(){cruise=false;cmd("/api/nav/stop")}
 function handPreset(preset){cmd("/api/hand/preset",{lr:handSide.value,preset})}function handBoth(){presets.forEach(()=>{});cmd("/api/hand/angles",{lr:"l",angles:hand});cmd("/api/hand/angles",{lr:"r",angles:hand})}
 function setHand(i,v){hand[i]=v;document.getElementById("handv"+i).textContent=v}function sendHandAngles(){cmd("/api/hand/angles",{lr:handSide.value,angles:hand})}
 function setArm(i,v){arm[i]=+v;document.getElementById("armv"+i).textContent=(+v).toFixed(2)}function sendArm(){cmd("/api/arm/joints",{joints:arm})}
@@ -1210,8 +1325,13 @@ async function armActivate(){let j=await cmd("/api/arm/activate");let joints=j.d
 function armRelease(){cmd("/api/arm/release")}function armZero(){arm=Array(14).fill(0);syncArm();sendArm()}
 async function armRead(){try{let r=await fetch("/api/arm/current");let j=await r.json();if(j.ok&&j.data.joints){arm=j.data.joints.slice(0,14);syncArm();add("OK 读取当前姿态")}}catch(e){add("读取失败 "+e)}}
 function syncArm(){arm.forEach((v,i)=>{let s=document.getElementById("arm"+i),l=document.getElementById("armv"+i);if(s){s.value=Math.round(v*100);l.textContent=(+v).toFixed(2)}})}
-async function poll(){try{let r=await fetch("/api/status");let j=await r.json();statusData=j.data||{};status.textContent=statusData.ready?"G1: 已连接":"G1: 未连接";status.style.color=statusData.ready?"#a6e3a1":"#f38ba8";detail.textContent=`arm:${statusData.arm_active?"运行":"待机"} hand:${statusData.hand_ready?"就绪":"未就绪"}`;statusJson.textContent=JSON.stringify(statusData,null,2);if(statusData.actions){allActions.innerHTML=statusData.actions.map(a=>`<button onclick="action('${a}')">${a}</button>`).join("")}}catch(e){status.textContent="离线";detail.textContent="---"}}
-setInterval(poll,1500);poll();
+async function loadMap(){try{let r=await fetch("/api/map");let j=await r.json();if(j.ok){webMap=j.data;drawMap();add("地图加载 "+webMap.width+"x"+webMap.height)}}catch(e){add("地图加载失败 "+e)}}
+function worldToPix(x,y){let m=webMap;return {x:(x-m.origin[0])/m.resolution,y:m.height-1-(y-m.origin[1])/m.resolution}}
+function pixToWorld(px,py){let m=webMap;return {x:px*m.resolution+m.origin[0],y:(m.height-1-py)*m.resolution+m.origin[1]}}
+function drawMap(){let c=document.getElementById("mapCanvas");if(!c||!webMap)return;let ctx=c.getContext("2d"),w=webMap.width,h=webMap.height;c.width=w;c.height=h;let img=ctx.createImageData(w,h),p=webMap.pixels;for(let y=0;y<h;y++){for(let x=0;x<w;x++){let g=p[y*w+x],i=(y*w+x)*4;img.data[i]=g;img.data[i+1]=g;img.data[i+2]=g;img.data[i+3]=255}}ctx.putImageData(img,0,0);ctx.fillStyle="#ff6600";waypoints.forEach((wp,i)=>{let q=worldToPix(wp.x,wp.y);ctx.beginPath();ctx.arc(q.x,q.y,5,0,Math.PI*2);ctx.fill();ctx.fillText(String(i+1),q.x+6,q.y-6)});let pose=statusData.nav_pose;if(pose){let q=worldToPix(pose.x,pose.y),yaw=pose.yaw||0;ctx.save();ctx.translate(q.x,q.y);ctx.rotate(-yaw);ctx.fillStyle="#00e5ff";ctx.beginPath();ctx.moveTo(12,0);ctx.lineTo(-8,7);ctx.lineTo(-8,-7);ctx.closePath();ctx.fill();ctx.restore()}}
+mapCanvas.addEventListener("click",ev=>{if(!webMap)return;let r=mapCanvas.getBoundingClientRect(),p=pixToWorld((ev.clientX-r.left)*webMap.width/r.width,(ev.clientY-r.top)*webMap.height/r.height);goalX.value=p.x.toFixed(2);goalY.value=p.y.toFixed(2);drawMap()});
+async function poll(){try{let r=await fetch("/api/status");let j=await r.json();statusData=j.data||{};status.textContent=statusData.ready?"G1: 已连接":"G1: 未连接";status.style.color=statusData.ready?"#a6e3a1":"#f38ba8";detail.textContent=`nav:${statusData.nav||"-"} arm:${statusData.arm_active?"运行":"待机"}`;statusJson.textContent=JSON.stringify(statusData,null,2);if(statusData.actions){allActions.innerHTML=statusData.actions.map(a=>`<button onclick="action('${a}')">${a}</button>`).join("")}drawMap()}catch(e){status.textContent="离线";detail.textContent="---"}}
+setInterval(poll,1000);loadMap();poll();
 </script>
 </body>
 </html>
@@ -1257,6 +1377,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(raw)
             elif path == "/api/status":
                 self._ok(self.robot.status())
+            elif path == "/api/map":
+                self._ok(load_web_map())
             elif path == "/api/arm/current":
                 self._ok({"joints": self.robot.arm_current()})
             else:

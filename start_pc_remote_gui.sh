@@ -4,8 +4,11 @@
 set -e
 
 BASE="$(cd "$(dirname "$0")" && pwd)"
+RUNTIME_DIR="${BASE}/.runtime"
+LAST_HOST_FILE="${RUNTIME_DIR}/last_g1_backend_host"
+mkdir -p "$RUNTIME_DIR"
 G1_WIRED_HOST="${G1_WIRED_HOST:-192.168.123.164}"
-G1_WIFI_HOST="${G1_WIFI_HOST:-}"
+G1_WIFI_HOST="${G1_WIFI_HOST:-192.168.13.24}"
 G1_BACKEND_HOST="${G1_BACKEND_HOST:-${G1_HOST:-}}"
 G1_USER="${G1_USER:-unitree}"
 G1_BACKEND_PORT="${G1_BACKEND_PORT:-5055}"
@@ -14,6 +17,8 @@ SSH_CHECK_OPTS=(-o BatchMode=yes -o ConnectTimeout=2)
 TUNNEL_PID=""
 BACKEND_ADDR=""
 BACKEND_HOST=""
+LAST_BACKEND_HOST=""
+[ -f "$LAST_HOST_FILE" ] && LAST_BACKEND_HOST="$(tr -d '[:space:]' < "$LAST_HOST_FILE")"
 export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8}"
 export no_proxy="${no_proxy:-$NO_PROXY}"
 
@@ -86,55 +91,39 @@ wifi_prefixes() {
         }' | sort -u
 }
 
+try_backend_host() {
+    local host="$1"
+    [ -z "$host" ] && return 1
+    echo "[pc-gui] checking backend ${host}:${G1_BACKEND_PORT}..." >&2
+    if can_http "$host"; then
+        BACKEND_ADDR="${host}:${G1_BACKEND_PORT}"
+        BACKEND_HOST="$host"
+        return 0
+    fi
+    if can_ssh "$host"; then
+        if start_remote_backend "$host"; then
+            return 0
+        fi
+        start_tunnel "$host"
+        return 0
+    fi
+    return 1
+}
+
 discover_backend() {
     if [ -n "$G1_BACKEND_HOST" ]; then
-        if can_http "$G1_BACKEND_HOST"; then
-            BACKEND_ADDR="${G1_BACKEND_HOST}:${G1_BACKEND_PORT}"
-            BACKEND_HOST="$G1_BACKEND_HOST"
-            return 0
-        fi
-        if can_ssh "$G1_BACKEND_HOST"; then
-            if start_remote_backend "$G1_BACKEND_HOST"; then
-                return 0
-            fi
-            start_tunnel "$G1_BACKEND_HOST"
-            return 0
-        fi
+        try_backend_host "$G1_BACKEND_HOST" && return 0
         echo "[pc-gui] 指定的 G1_BACKEND_HOST 不可访问: $G1_BACKEND_HOST" >&2
         return 1
     fi
-    for host in "$G1_WIRED_HOST" "$G1_WIFI_HOST" "192.168.1.24"; do
-        [ -z "$host" ] && continue
-        echo "[pc-gui] checking backend ${host}:${G1_BACKEND_PORT}..." >&2
-        if can_http "$host"; then
-            BACKEND_ADDR="${host}:${G1_BACKEND_PORT}"
-            BACKEND_HOST="$host"
-            return 0
-        fi
-        if can_ssh "$host"; then
-            if start_remote_backend "$host"; then
-                return 0
-            fi
-            start_tunnel "$host"
-            return 0
-        fi
+    for host in "$LAST_BACKEND_HOST" "$G1_WIFI_HOST" "192.168.1.24" "$G1_WIRED_HOST"; do
+        try_backend_host "$host" && return 0
     done
     for prefix in $(wifi_prefixes); do
         for suffix in 24 164; do
             host="${prefix}.${suffix}"
             echo "[pc-gui] probing backend ${host}:${G1_BACKEND_PORT}..." >&2
-            if can_http "$host"; then
-                BACKEND_ADDR="${host}:${G1_BACKEND_PORT}"
-                BACKEND_HOST="$host"
-                return 0
-            fi
-            if can_ssh "$host"; then
-                if start_remote_backend "$host"; then
-                    return 0
-                fi
-                start_tunnel "$host"
-                return 0
-            fi
+            try_backend_host "$host" && return 0
         done
     done
     echo "[pc-gui] 未找到 G1 后台服务。先在 G1 上运行: cd /home/unitree/zgx_g1 && ./start_g1_backend.sh" >&2
@@ -148,9 +137,16 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-discover_backend
-export HONGTU_G1_BACKEND_URL="http://${BACKEND_ADDR}"
-export HONGTU_REMOTE_AUTO_CONNECT="${HONGTU_REMOTE_AUTO_CONNECT:-1}"
+if discover_backend; then
+    [ -n "$BACKEND_HOST" ] && printf '%s\n' "$BACKEND_HOST" > "$LAST_HOST_FILE"
+    export HONGTU_G1_BACKEND_URL="http://${BACKEND_ADDR}"
+    export HONGTU_REMOTE_AUTO_CONNECT="${HONGTU_REMOTE_AUTO_CONNECT:-1}"
+else
+    FALLBACK_HOST="${LAST_BACKEND_HOST:-${G1_WIFI_HOST:-192.168.13.24}}"
+    export HONGTU_G1_BACKEND_URL="http://${FALLBACK_HOST}:${G1_BACKEND_PORT}"
+    export HONGTU_REMOTE_AUTO_CONNECT=0
+    echo "[pc-gui] 自动连接失败，仍打开 GUI，可在左上角手动修改并连接: $HONGTU_G1_BACKEND_URL" >&2
+fi
 
 echo "[pc-gui] backend: $HONGTU_G1_BACKEND_URL"
 if [ -n "$BACKEND_HOST" ]; then

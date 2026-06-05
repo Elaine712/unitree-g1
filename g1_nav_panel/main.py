@@ -1055,6 +1055,15 @@ class MainWindow(QMainWindow):
         self._remote_status_timer.setInterval(800)
         self._remote_status_timer.timeout.connect(self._poll_remote_status)
         self._remote_status_busy = False
+        self._teleop_timer = QTimer(self)
+        self._teleop_timer.setInterval(200)
+        self._teleop_timer.timeout.connect(self._teleop_tick)
+        self._teleop_send_lock = threading.Lock()
+        self._teleop_send_event = threading.Event()
+        self._teleop_worker_stop = threading.Event()
+        self._teleop_send_target = (0.0, 0.0, 0.0)
+        self._teleop_send_thread = threading.Thread(target=self._teleop_send_loop, daemon=True)
+        self._teleop_send_thread.start()
 
         self._init_ui()
         self.log_message.connect(self._append_log)
@@ -1068,6 +1077,7 @@ class MainWindow(QMainWindow):
     def _init_ui(self):
         self.setWindowTitle("G1 导航控制台")
         self.resize(1300, 850)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.setMinimumSize(900, 600)
 
         # 暗色主题 - 现代化配色
@@ -1429,10 +1439,8 @@ class MainWindow(QMainWindow):
             else:
                 btn.setMinimumSize(64, 48)
             btn.setStyleSheet("font-size: 18px; font-weight: bold;")
-            btn.pressEvent = lambda e=None: self._teleop_start(vx, vy, wz)
-            btn.releaseEvent = lambda e=None: self._teleop_stop()
-            btn.mousePressEvent = btn.pressEvent
-            btn.mouseReleaseEvent = btn.releaseEvent
+            btn.pressed.connect(lambda vx=vx, vy=vy, wz=wz: self._teleop_start(vx, vy, wz))
+            btn.released.connect(self._teleop_stop)
             return btn
 
         btn_fwd = make_btn("▲\nW", vx=1)
@@ -1441,8 +1449,9 @@ class MainWindow(QMainWindow):
         btn_right = make_btn("▶\nD", wz=-1)
         btn_stop = make_btn("■\n空格", big=True)
         btn_stop.setStyleSheet("font-size: 20px; font-weight: bold; background: #c0392b; color: #fff;")
-        btn_stop.mousePressEvent = lambda e: self._teleop_stop()
-        btn_stop.mouseReleaseEvent = None
+        btn_stop.pressed.disconnect()
+        btn_stop.released.disconnect()
+        btn_stop.clicked.connect(self._teleop_stop)
         btn_lat_left = make_btn("←横\nQ", vy=1)
         btn_lat_right = make_btn("→横\nE", vy=-1)
 
@@ -2787,14 +2796,21 @@ class MainWindow(QMainWindow):
             try:
                 self._log(f"[G1远程] 连接后台服务: {url}")
                 self._g1_remote = G1RemoteClient(url, timeout=3.0)
-                status = self._g1_remote.connect().get("data", {})
+                try:
+                    status = self._g1_remote.connect().get("data", {})
+                except Exception:
+                    if not self._try_start_remote_backend(url):
+                        raise
+                    self._g1_remote = G1RemoteClient(url, timeout=3.0)
+                    status = self._g1_remote.connect().get("data", {})
                 self._g1_ready = True
                 self._arm_sdk_ready = bool(status.get("arm_ready", True))
                 self._hand_ready = bool(status.get("hand_ready", False))
                 self._btn_g1.setText("断开 G1")
-                self._g1_label.setText("G1: 远程已连接")
+                self._nav_net_if.setText(url)
+                self._g1_label.setText(f"G1: 远程已连接 {url}")
                 self._g1_label.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px 10px; color: #27ae60;")
-                self._status_g1.setText("G1: 远程已连接")
+                self._status_g1.setText(f"G1: 远程已连接 {url}")
                 self._log("[G1远程] 连接成功，本地 GUI 中文输入保持 PC 输入法")
                 self._load_local_map_for_display()
                 self._on_remote_status(status)
@@ -3205,9 +3221,20 @@ class MainWindow(QMainWindow):
         if self._ros_worker:
             self._ros_worker.send_cmd_vel(self._teleop_vx, self._teleop_vy, self._teleop_wz)
         self._g1_move(self._teleop_vx, self._teleop_vy, self._teleop_wz)
+        if not self._teleop_timer.isActive():
+            self._teleop_timer.start()
+
+    def _teleop_tick(self):
+        if not self._teleop_active:
+            self._teleop_timer.stop()
+            return
+        if self._ros_worker:
+            self._ros_worker.send_cmd_vel(self._teleop_vx, self._teleop_vy, self._teleop_wz)
+        self._g1_move(self._teleop_vx, self._teleop_vy, self._teleop_wz)
 
     def _teleop_stop(self):
         self._teleop_active = False
+        self._teleop_timer.stop()
         self._teleop_vx = self._teleop_vy = self._teleop_wz = 0.0
         if self._ros_worker:
             self._ros_worker.send_cmd_vel(0, 0, 0)
@@ -3222,6 +3249,35 @@ class MainWindow(QMainWindow):
             self._ros_worker.send_cmd_vel(0, 0, 0)
         self._g1_move(0, 0, 0)
         self._log("[急停] 已停止所有运动")
+
+    def keyPressEvent(self, e):
+        if e.isAutoRepeat():
+            return
+        key = e.key()
+        if key in (Qt.Key_W, Qt.Key_Up):
+            self._teleop_start(vx=1)
+        elif key in (Qt.Key_S, Qt.Key_Down):
+            self._teleop_start(vx=-1)
+        elif key in (Qt.Key_A, Qt.Key_Left):
+            self._teleop_start(wz=1)
+        elif key in (Qt.Key_D, Qt.Key_Right):
+            self._teleop_start(wz=-1)
+        elif key == Qt.Key_Q:
+            self._teleop_start(vy=1)
+        elif key == Qt.Key_E:
+            self._teleop_start(vy=-1)
+        elif key == Qt.Key_Space:
+            self._emergency_stop()
+        else:
+            super().keyPressEvent(e)
+
+    def keyReleaseEvent(self, e):
+        if e.isAutoRepeat():
+            return
+        if e.key() in (Qt.Key_W, Qt.Key_Up, Qt.Key_S, Qt.Key_Down, Qt.Key_A, Qt.Key_Left, Qt.Key_D, Qt.Key_Right, Qt.Key_Q, Qt.Key_E):
+            self._teleop_stop()
+        else:
+            super().keyReleaseEvent(e)
 
     # ---- G1 辅助 ----
     def _g1_api(self, func):
@@ -3264,6 +3320,32 @@ class MainWindow(QMainWindow):
         self._g1_api(func)
 
     def _g1_move(self, vx, vy, wz):
+        with self._teleop_send_lock:
+            self._teleop_send_target = (float(vx), float(vy), float(wz))
+        self._teleop_send_event.set()
+
+    def _teleop_send_loop(self):
+        last_sent = None
+        while not self._teleop_worker_stop.is_set():
+            self._teleop_send_event.wait(0.12)
+            self._teleop_send_event.clear()
+            with self._teleop_send_lock:
+                vx, vy, wz = self._teleop_send_target
+            active = bool(abs(vx) > 1e-4 or abs(vy) > 1e-4 or abs(wz) > 1e-4)
+            target = (vx, vy, wz, active)
+            if not active and last_sent == target:
+                continue
+            try:
+                self._g1_move_sync(vx, vy, wz, active)
+                last_sent = target
+            except Exception as e:
+                now = time.time()
+                last = getattr(self, "_last_move_error_log", 0.0)
+                if now - last > 2.0:
+                    self._last_move_error_log = now
+                    self._log(f"[遥控] 发送移动失败: {e}")
+
+    def _g1_move_sync(self, vx, vy, wz, continuous):
         if not self._g1_ready:
             now = time.time()
             last = getattr(self, "_last_move_not_ready_log", 0.0)
@@ -3273,11 +3355,11 @@ class MainWindow(QMainWindow):
             return
         try:
             if self._g1_remote_mode and self._g1_remote:
-                self._g1_remote.move(vx, vy, wz, continuous=False)
+                self._g1_remote.move(vx, vy, wz, continuous=continuous)
                 return
-            self._g1_loco.Move(vx, vy, wz, continous_move=False)
-        except Exception as e:
-            self._log(f"[遥控] 发送移动失败: {e}")
+            self._g1_loco.Move(vx, vy, wz, continous_move=continuous)
+        except Exception:
+            raise
 
     def _g1_arm_action(self, name):
         self._ensure_arm_sdk_released("执行预设动作前")
@@ -3624,6 +3706,36 @@ class MainWindow(QMainWindow):
         """线程安全的日志输出"""
         self.log_message.emit(msg)
 
+    def _try_start_remote_backend(self, url):
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            host = parsed.hostname
+            port = parsed.port or 5055
+            if not host or host in ("127.0.0.1", "localhost"):
+                return False
+            self._log(f"[G1远程] 后台未响应，尝试 SSH 启动: {host}")
+            subprocess.run(
+                [
+                    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
+                    f"unitree@{host}",
+                    f"cd /home/unitree/zgx_g1 && mkdir -p .runtime && if ! ss -ltn | grep -q ':{port} '; then nohup ./start_g1_backend.sh > .runtime/g1_backend.log 2>&1 < /dev/null & fi",
+                ],
+                check=False,
+                timeout=5,
+            )
+            for _ in range(20):
+                try:
+                    client = G1RemoteClient(url, timeout=1.5)
+                    client.status()
+                    self._log(f"[G1远程] 后台已启动: {url}")
+                    return True
+                except Exception:
+                    time.sleep(0.5)
+        except Exception as e:
+            self._log(f"[G1远程] SSH 启动后台失败: {e}")
+        return False
+
     def _append_log(self, msg):
         """真正写入日志（仅在 GUI 线程调用）"""
         self._log_view.appendPlainText(msg)
@@ -3646,6 +3758,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, e):
         # 紧急停止机器人
         self._emergency_stop()
+        time.sleep(0.05)
+        self._teleop_worker_stop.set()
+        self._teleop_send_event.set()
         # 发送多次停止命令确保生效
         for _ in range(3):
             try:
