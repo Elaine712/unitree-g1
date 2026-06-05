@@ -329,6 +329,7 @@ class G1Robot:
             "arm_ready": self.arm_ready,
             "arm_active": self.arm_active,
             "hand_ready": self.hand_ready,
+            "hand_state": self.hand_state,
             "moving": self.moving,
             "nav": self.nav_status,
             "nav_running": bool(self.nav_proc and self.nav_proc.poll() is None),

@@ -1021,6 +1021,7 @@ class MainWindow(QMainWindow):
         self._hand_pub_l = None
         self._hand_pub_r = None
         self._hand_ready = False
+        self._hand_state = {"l": {}, "r": {}}
         self._arm_sdk_ready = False
         self._arm_sdk_pub = None
         self._arm_sdk_cmd = None
@@ -1833,6 +1834,19 @@ class MainWindow(QMainWindow):
 
     def _ht_publish(self, side):
         """发布一侧手的 DDS 控制指令"""
+        if self._g1_remote_mode and self._g1_remote:
+            angles = [int(v) for v in self._ht_targets.get(side, [500] * 6)]
+            def worker():
+                try:
+                    self._g1_remote.hand_angles(side, angles)
+                except Exception as e:
+                    now = time.time()
+                    last = getattr(self, "_last_hand_remote_error_log", 0.0)
+                    if now - last > 2.0:
+                        self._last_hand_remote_error_log = now
+                        self._log(f"[灵巧手] 远程角度发送失败: {e}")
+            threading.Thread(target=worker, daemon=True).start()
+            return
         if not self._hand_ready:
             return
         pub = self._hand_pub_r if side == "r" else self._hand_pub_l
@@ -1901,9 +1915,10 @@ class MainWindow(QMainWindow):
                 if canvas and angles:
                     canvas.update_pos(angles)
 
-        # 持续发布 target（确保 DDS 到手部通路畅通）
-        for side in ("l", "r"):
-            self._ht_publish(side)
+        # 本地 DDS 模式持续发布 target；远程模式只在滑条/预设变化时发送，避免 HTTP 卡顿。
+        if not self._g1_remote_mode:
+            for side in ("l", "r"):
+                self._ht_publish(side)
 
     def _ht_estop(self):
         """灵巧手急停：双手全部张开"""
@@ -2943,6 +2958,16 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_remote_status(self, data):
+        if isinstance(data, dict):
+            self._hand_ready = bool(data.get("hand_ready", self._hand_ready))
+            state = data.get("hand_state")
+            if isinstance(state, dict):
+                self._hand_state = state
+            if hasattr(self, "_btn_hand_status"):
+                self._btn_hand_status.setText("就绪" if self._hand_ready else "未就绪")
+                self._btn_hand_status.setStyleSheet(
+                    "color: #27ae60; font-weight: bold;" if self._hand_ready else "color: #888;"
+                )
         pose = data.get("nav_pose") if isinstance(data, dict) else None
         if pose:
             try:
