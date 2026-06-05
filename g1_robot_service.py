@@ -20,6 +20,8 @@ from urllib.parse import urlparse
 
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+RUNTIME_DIR = os.path.join(BASE, ".runtime")
+LAST_RELOC_FILE = os.path.join(RUNTIME_DIR, "last_success_reloc.json")
 for path in (os.path.join(BASE, "unitree_sdk2_python"), os.path.join(BASE, "inspire_hand")):
     if os.path.isdir(path) and path not in sys.path:
         sys.path.insert(0, path)
@@ -642,6 +644,68 @@ class G1Robot:
         threading.Thread(target=self._nav_reloc_worker, args=(x, y, yaw), daemon=True).start()
         self.log(f"[重定位] 已排队后台执行: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
 
+    def _load_last_reloc_pose(self):
+        try:
+            with open(LAST_RELOC_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return float(data["x"]), float(data["y"]), float(data["yaw"])
+        except Exception:
+            return None
+
+    def _save_last_reloc_pose(self, x, y, yaw):
+        try:
+            os.makedirs(RUNTIME_DIR, exist_ok=True)
+            data = {"x": float(x), "y": float(y), "yaw": float(yaw), "yaw_deg": math.degrees(float(yaw)), "time": time.time()}
+            with open(LAST_RELOC_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.log(f"[重定位] 保存成功位姿失败: {e}")
+
+    def _parse_reloc_candidates(self):
+        candidates = []
+        last = self._load_last_reloc_pose()
+        if last:
+            candidates.append(last)
+            self.log(f"[重定位] 自动候选包含上次成功位姿: ({last[0]:.2f}, {last[1]:.2f}, {math.degrees(last[2]):.0f}°)")
+
+        raw = os.environ.get("HONGTU_AUTO_RELOC_CANDIDATES", "").strip()
+        if raw:
+            for item in raw.split(";"):
+                parts = [p.strip() for p in item.split(",") if p.strip()]
+                if len(parts) != 3:
+                    continue
+                try:
+                    candidates.append((float(parts[0]), float(parts[1]), math.radians(float(parts[2]))))
+                except Exception:
+                    self.log(f"[重定位] 忽略无效候选: {item}")
+
+        x = float(os.environ.get("HONGTU_START_X", "0.0"))
+        y = float(os.environ.get("HONGTU_START_Y", "0.0"))
+        yaw = math.radians(float(os.environ.get("HONGTU_START_YAW_DEG", "132")))
+        candidates.append((x, y, yaw))
+        return candidates
+
+    def _expanded_reloc_candidates(self):
+        xy_step = float(os.environ.get("HONGTU_AUTO_RELOC_XY_STEP", "0.3"))
+        yaw_step = float(os.environ.get("HONGTU_AUTO_RELOC_YAW_STEP_DEG", "15"))
+        max_tries = int(os.environ.get("HONGTU_AUTO_RELOC_MAX_TRIES", "40"))
+        xy_offsets = [(0.0, 0.0), (xy_step, 0.0), (-xy_step, 0.0), (0.0, xy_step), (0.0, -xy_step)]
+        yaw_offsets = [0.0, yaw_step, -yaw_step, yaw_step * 2.0, -yaw_step * 2.0]
+        seen = set()
+        out = []
+        for x, y, yaw in self._parse_reloc_candidates():
+            for dx, dy in xy_offsets:
+                for dyaw_deg in yaw_offsets:
+                    item = (x + dx, y + dy, yaw + math.radians(dyaw_deg))
+                    key = (round(item[0], 2), round(item[1], 2), round(math.degrees(item[2])))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(item)
+                    if len(out) >= max_tries:
+                        return out
+        return out
+
     def _nav_reloc_worker(self, x, y, yaw):
         current = (x, y, yaw)
         try:
@@ -664,7 +728,7 @@ class G1Robot:
             with self.nav_reloc_lock:
                 self.nav_reloc_busy = False
 
-    def _nav_reloc_once(self, x, y, yaw):
+    def _nav_reloc_once(self, x, y, yaw, fallback_initialpose=True):
         self._wait_nav_ros()
         import rospy
         from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -690,8 +754,10 @@ class G1Robot:
             self.nav_last_reloc_error = str(e)
 
         if icp_ok:
+            self._save_last_reloc_pose(x, y, yaw)
+            self.log(f"[重定位] ICP 重定位成功: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)，已保存为下次优先候选")
             self.log("[重定位] ICP 已成功，跳过 initialpose，使用 FAST-LIO 校准后的 map->body 位姿")
-        else:
+        elif fallback_initialpose:
             msg = PoseWithCovarianceStamped()
             msg.header.frame_id = "map"
             msg.header.stamp = rospy.Time.now()
@@ -709,16 +775,40 @@ class G1Robot:
         self.nav_status = "reloc_sent"
         self.nav_last_reloc = {"x": x, "y": y, "yaw": yaw, "queued": False}
         self.log(f"[重定位] 完成: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°) icp_ok={icp_ok}")
+        return icp_ok
 
     def nav_auto_reloc(self):
         try:
             time.sleep(float(os.environ.get("HONGTU_AUTO_RELOC_DELAY", "6")))
-            x = float(os.environ.get("HONGTU_START_X", "0.0"))
-            y = float(os.environ.get("HONGTU_START_Y", "0.0"))
-            yaw = math.radians(float(os.environ.get("HONGTU_START_YAW_DEG", "132")))
-            self.log(f"[重定位] 自动重定位: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
-            self.nav_reloc(x, y, yaw)
+            with self.nav_reloc_lock:
+                if self.nav_reloc_busy:
+                    self.log("[重定位] 自动重定位跳过：已有重定位任务在执行")
+                    return
+                self.nav_reloc_busy = True
+            candidates = self._expanded_reloc_candidates()
+            self.log(f"[重定位] 自动重定位开始，共 {len(candidates)} 个候选")
+            last_error = None
+            try:
+                for i, (x, y, yaw) in enumerate(candidates, 1):
+                    self.log(f"[重定位] 自动尝试 {i}/{len(candidates)}: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+                    try:
+                        self.nav_status = "reloc_pending"
+                        self.nav_last_reloc = {"x": x, "y": y, "yaw": yaw, "queued": True, "auto": True}
+                        if self._nav_reloc_once(x, y, yaw, fallback_initialpose=False):
+                            self.log(f"[重定位] 自动重定位成功: 使用候选 {i}/{len(candidates)}")
+                            return
+                    except Exception as e:
+                        last_error = str(e)
+                        self.log(f"[重定位] 自动候选失败: {e}")
+                self.nav_last_reloc_error = last_error or "all candidates failed"
+                self.nav_status = "reloc_failed"
+                self.log("[重定位] 自动重定位失败：所有候选 ICP 未成功，请手动拖拽重定位")
+            finally:
+                with self.nav_reloc_lock:
+                    self.nav_reloc_busy = False
         except Exception as e:
+            with self.nav_reloc_lock:
+                self.nav_reloc_busy = False
             self.log(f"[重定位] 自动重定位失败: {e}")
 
     def ensure_arm_released(self, reason=""):
