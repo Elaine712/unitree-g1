@@ -1022,6 +1022,8 @@ class MainWindow(QMainWindow):
         self._hand_pub_r = None
         self._hand_ready = False
         self._hand_state = {"l": {}, "r": {}}
+        self._hand_force_zero = {"l": [0] * 6, "r": [0] * 6}
+        self._hand_force_auto_zeroed = False
         self._arm_sdk_ready = False
         self._arm_sdk_pub = None
         self._arm_sdk_cmd = None
@@ -1251,18 +1253,22 @@ class MainWindow(QMainWindow):
         fm.setLabelAlignment(Qt.AlignRight)
         self._edit_map = QLineEdit(self.cfg.get("map_yaml", ""))
         self._edit_map.setMinimumHeight(28)
-        btn_map = QPushButton("浏览…")
-        btn_map.setFixedWidth(60)
+        btn_map = QPushButton("浏览")
+        btn_map.setFixedSize(72, 28)
         btn_map.clicked.connect(lambda: self._browse_file(self._edit_map, "YAML 地图文件 (*.yaml *.yml)"))
         row = QHBoxLayout()
+        row.setSpacing(6)
         row.addWidget(self._edit_map, 1)
         row.addWidget(btn_map)
         fm.addRow("2D 地图:", row)
 
         self._edit_pcd = QLineEdit(self.cfg.get("pcd_path", ""))
-        btn_pcd = QPushButton("浏览…")
+        self._edit_pcd.setMinimumHeight(28)
+        btn_pcd = QPushButton("浏览")
+        btn_pcd.setFixedSize(72, 28)
         btn_pcd.clicked.connect(lambda: self._browse_file(self._edit_pcd, "PCD 点云文件 (*.pcd)"))
         row = QHBoxLayout()
+        row.setSpacing(6)
         row.addWidget(self._edit_pcd, 1)
         row.addWidget(btn_pcd)
         fm.addRow("3D 点云:", row)
@@ -1337,8 +1343,7 @@ class MainWindow(QMainWindow):
                        ("握手", "shake hand"), ("拒绝", "reject")]
         for cn_name, an in quick_acts:
             btn = QPushButton(cn_name)
-            btn.setMinimumWidth(64)
-            btn.setMinimumHeight(28)
+            btn.setFixedSize(64, 30)
             btn.clicked.connect(lambda checked, n=an: self._g1_arm_action(n))
             row2.addWidget(btn)
         row2.addStretch()
@@ -1350,8 +1355,7 @@ class MainWindow(QMainWindow):
             row_hand.addWidget(QLabel("手部:"))
             for hname in ["张开", "握拳", "OK", "点赞", "点按"]:
                 btn = QPushButton(hname)
-                btn.setMinimumWidth(58)
-                btn.setMinimumHeight(28)
+                btn.setFixedSize(64, 30)
                 btn.clicked.connect(lambda checked, n=hname: self._hand_set_preset("r", n))
                 row_hand.addWidget(btn)
             row_hand.addStretch()
@@ -1590,21 +1594,6 @@ class MainWindow(QMainWindow):
 
         # ---- 灵巧手集成 ----
         if HAND_OK:
-            # 灵巧手状态
-            grp = QGroupBox("灵巧手 DDS")
-            gl = QHBoxLayout(grp)
-            self._btn_hand_status = QLabel("未就绪" if not self._hand_ready else "就绪")
-            self._btn_hand_status.setStyleSheet(
-                "color: #888;" if not self._hand_ready else "color: #27ae60; font-weight: bold;")
-            gl.addWidget(QLabel("状态:"))
-            gl.addWidget(self._btn_hand_status)
-            reinit_hand = QPushButton("重新初始化")
-            reinit_hand.clicked.connect(lambda: self._init_hand_dds(
-                self._nav_net_if.text().strip()))
-            gl.addWidget(reinit_hand)
-            gl.addStretch()
-            layout.addWidget(grp)
-
             # 协同动作
             grp = QGroupBox("协同动作（手臂 + 灵巧手）")
             gl = QHBoxLayout(grp)
@@ -1720,9 +1709,17 @@ class MainWindow(QMainWindow):
             top.addWidget(btn)
         top.addStretch()
 
-        self._ht_status = QLabel("DDS: 未就绪")
-        self._ht_status.setStyleSheet("color:#f38ba8; font-weight:bold;")
-        top.addWidget(self._ht_status)
+        top.addWidget(QLabel("DDS:"))
+        self._btn_hand_status = QLabel("未就绪" if not self._hand_ready else "就绪")
+        self._btn_hand_status.setStyleSheet(
+            "color:#888;" if not self._hand_ready else "color:#27ae60; font-weight:bold;"
+        )
+        top.addWidget(self._btn_hand_status)
+        reinit_hand = QPushButton("重新初始化")
+        reinit_hand.setStyleSheet("font-size:11px; padding:2px 8px;")
+        reinit_hand.clicked.connect(lambda: self._init_hand_dds(self._nav_net_if.text().strip()))
+        top.addWidget(reinit_hand)
+        self._ht_status = self._btn_hand_status
         layout.addLayout(top)
 
         # ── 双手面板 ──
@@ -1784,18 +1781,66 @@ class MainWindow(QMainWindow):
 
         # ── 力传感器反馈 ──
         fb_grp = QGroupBox("力传感器反馈")
-        fb_grid = QHBoxLayout(fb_grp)
+        fb_wrap = QVBoxLayout(fb_grp)
+        fb_wrap.setSpacing(10)
+        fb_wrap.setContentsMargins(10, 16, 10, 10)
+
+        fb_top = QHBoxLayout()
+        title = QLabel("校准后压力值")
+        title.setStyleSheet("font-weight:bold; color:#cdd6f4;")
+        fb_top.addWidget(title)
+        fb_top.addStretch()
+        btn_zero = QPushButton("校准零点")
+        btn_zero.setToolTip("手自然张开且未接触物体时点击，将当前力值作为零点")
+        btn_zero.setStyleSheet("font-size:11px; padding:3px 12px;")
+        btn_zero.clicked.connect(self._ht_zero_force)
+        fb_top.addWidget(btn_zero)
+        fb_wrap.addLayout(fb_top)
+
+        fb_grid = QHBoxLayout()
+        fb_grid.setSpacing(14)
         self._ht_force_lbls = {"l": [], "r": []}
+        self._ht_force_bars = {"l": [], "r": []}
         for side, sn in (("l", "左手"), ("r", "右手")):
-            col = QVBoxLayout()
-            col.addWidget(QLabel(sn))
+            panel = QWidget()
+            panel.setStyleSheet("background:#24243a; border:1px solid #343450; border-radius:6px;")
+            col = QVBoxLayout(panel)
+            col.setSpacing(6)
+            col.setContentsMargins(10, 8, 10, 10)
+
+            head = QLabel(sn)
+            head.setAlignment(Qt.AlignCenter)
+            head.setStyleSheet("color:#a6e3a1; font-weight:bold; background:transparent; border:0;")
+            col.addWidget(head)
+
             for fname in ["小指","无名指","中指","食指","拇指屈","拇指旋"]:
-                lbl = QLabel(f"{fname}: --")
-                lbl.setStyleSheet("font-size:10px;")
-                col.addWidget(lbl)
-                self._ht_force_lbls[side].append(lbl)
-            fb_grid.addLayout(col)
-        fb_grid.addStretch()
+                row = QHBoxLayout()
+                row.setSpacing(8)
+                name_lbl = QLabel(fname)
+                name_lbl.setFixedWidth(42)
+                name_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                name_lbl.setStyleSheet("font-size:10px; color:#cdd6f4; background:transparent; border:0;")
+                row.addWidget(name_lbl)
+                bar = QProgressBar()
+                bar.setRange(0, 1000)
+                bar.setValue(0)
+                bar.setTextVisible(False)
+                bar.setFixedHeight(14)
+                bar.setStyleSheet(
+                    "QProgressBar { border:0; border-radius:5px; background:#181825; }"
+                    "QProgressBar::chunk { border-radius:5px; background:#89dceb; }"
+                )
+                row.addWidget(bar, 1)
+                val_lbl = QLabel("--")
+                val_lbl.setFixedWidth(34)
+                val_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                val_lbl.setStyleSheet("font-size:10px; color:#cdd6f4; background:transparent; border:0; font-family:monospace;")
+                row.addWidget(val_lbl)
+                col.addLayout(row)
+                self._ht_force_lbls[side].append(val_lbl)
+                self._ht_force_bars[side].append(bar)
+            fb_grid.addWidget(panel, 1)
+        fb_wrap.addLayout(fb_grid)
         layout.addWidget(fb_grp)
 
         # ── 急停 ──
@@ -1888,21 +1933,41 @@ class MainWindow(QMainWindow):
         """定时器刷新: 更新力反馈 UI + 可视化 + 发布当前 target"""
         if not self._hand_ready:
             if hasattr(self, '_ht_status'):
-                self._ht_status.setText("DDS: 未就绪")
+                self._ht_status.setText("未就绪")
+                self._ht_status.setStyleSheet("color:#888; font-weight:bold;")
             return
-        self._ht_status.setText("DDS: 就绪")
+        self._ht_status.setText("就绪")
         self._ht_status.setStyleSheet("color:#a6e3a1; font-weight:bold;")
 
         # 刷新力反馈
+        if not self._hand_force_auto_zeroed:
+            ready = True
+            zeros = {}
+            for side in ("l", "r"):
+                forces = self._hand_state.get(side, {}).get("force", [])
+                if len(forces) < 6:
+                    ready = False
+                    break
+                zeros[side] = [int(forces[i]) for i in range(6)]
+            if ready:
+                self._hand_force_zero = zeros
+                self._hand_force_auto_zeroed = True
+                self._log("[灵巧手] 力反馈初始零点已自动校准")
+
         for side in ("l", "r"):
             st = self._hand_state.get(side, {})
             forces = st.get('force', [])
             angles = st.get('angle', [])
             for i in range(6):
                 # 力值
-                fv = int(forces[i]) if i < len(forces) else 0
+                raw_fv = int(forces[i]) if i < len(forces) else 0
+                zero = self._hand_force_zero.get(side, [0] * 6)
+                fv = max(0, raw_fv - (int(zero[i]) if i < len(zero) else 0))
                 lbl = self._ht_force_lbls[side][i]
-                lbl.setText(f"{['小指','无名指','中指','食指','拇指屈','拇指旋'][i]}: {max(0, fv)}")
+                lbl.setText(str(fv))
+                lbl.setToolTip(f"raw={raw_fv}, zero={zero[i] if i < len(zero) else 0}")
+                if hasattr(self, "_ht_force_bars") and i < len(self._ht_force_bars.get(side, [])):
+                    self._ht_force_bars[side][i].setValue(min(1000, fv))
                 # 角度反馈
                 if i < len(self._ht_sliders[side]):
                     _, _, fb_lbl = self._ht_sliders[side][i]
@@ -1919,6 +1984,16 @@ class MainWindow(QMainWindow):
         if not self._g1_remote_mode:
             for side in ("l", "r"):
                 self._ht_publish(side)
+
+    def _ht_zero_force(self):
+        """把当前未接触状态记录为力反馈零点。"""
+        for side in ("l", "r"):
+            st = self._hand_state.get(side, {})
+            forces = st.get("force", [])
+            vals = [int(forces[i]) if i < len(forces) else 0 for i in range(6)]
+            self._hand_force_zero[side] = vals
+        self._hand_force_auto_zeroed = True
+        self._log("[灵巧手] 力反馈零点已校准")
 
     def _ht_estop(self):
         """灵巧手急停：双手全部张开"""
