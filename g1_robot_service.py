@@ -380,12 +380,35 @@ class G1Robot:
         except Exception as e:
             self.log(f"[导航] 恢复 /control 失败: {e}")
 
+    def _pause_unitree_localization_for_nav(self):
+        """Stop Unitree's default localization TF publishers before HongTu navigation."""
+        if os.environ.get("HONGTU_PAUSE_UNITREE_LOCALIZATION", "1").lower() in ("0", "false", "no"):
+            return
+        patterns = [
+            "roslaunch G1_localization localization_mid360.launch",
+            "/G1_localization/G1_localization",
+            "/G1_localization/global_localization",
+            "/G1_localization/transform_fusion",
+        ]
+        stopped = False
+        for pattern in patterns:
+            try:
+                if subprocess.run(["pgrep", "-f", pattern], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                    stopped = True
+                subprocess.run(["pkill", "-f", pattern], check=False)
+            except Exception:
+                pass
+        if stopped:
+            self.log("[导航] 已暂停 G1 原厂定位 TF，避免与导航定位冲突")
+            time.sleep(0.8)
+
     def nav_start(self, map_yaml=None, pcd_path=None):
         with self.lock:
             if self.nav_proc and self.nav_proc.poll() is None:
                 self.nav_status = "running"
                 self._start_nav_bridge()
                 return
+            self._pause_unitree_localization_for_nav()
             self._cleanup_stale_nav_processes()
             self._pause_control_for_nav()
             map_yaml = map_yaml or os.environ.get(
@@ -612,7 +635,17 @@ class G1Robot:
         import rospy
         from geometry_msgs.msg import PoseStamped
 
-        x, y, yaw = float(x), float(y), float(yaw)
+        target_x, target_y, target_yaw = float(x), float(y), float(yaw)
+        backoff = float(os.environ.get("HONGTU_NAV_GOAL_BACKOFF_M", "0"))
+        lateral = float(os.environ.get("HONGTU_NAV_GOAL_LATERAL_M", "0"))
+        yaw_offset = math.radians(float(os.environ.get("HONGTU_NAV_GOAL_YAW_OFFSET_DEG", "0")))
+        yaw = target_yaw + yaw_offset
+        x, y = target_x, target_y
+        if abs(backoff) > 1e-6 or abs(lateral) > 1e-6:
+            x = target_x - backoff * math.cos(yaw)
+            y = target_y - backoff * math.sin(yaw)
+            x += lateral * -math.sin(yaw)
+            y += lateral * math.cos(yaw)
         msg = PoseStamped()
         msg.header.frame_id = "map"
         msg.header.stamp = rospy.Time.now()
@@ -626,9 +659,26 @@ class G1Robot:
         except Exception as e:
             self.log(f"[导航] 清除代价地图失败: {e}")
         self._publish_nav_msg(self.nav_goal_pub, msg, "goal")
-        self.nav_last_goal = {"x": x, "y": y, "yaw": yaw}
+        self.nav_last_goal = {
+            "x": target_x,
+            "y": target_y,
+            "yaw": target_yaw,
+            "sent_x": x,
+            "sent_y": y,
+            "sent_yaw": yaw,
+            "backoff": backoff,
+            "lateral": lateral,
+            "yaw_offset_deg": math.degrees(yaw_offset),
+        }
         self.nav_status = "goal_sent"
-        self.log(f"[导航] 目标已发布: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+        if abs(backoff) > 1e-6 or abs(lateral) > 1e-6 or abs(yaw_offset) > 1e-6:
+            self.log(
+                f"[导航] 目标已发布: 原始({target_x:.2f}, {target_y:.2f}) "
+                f"前后{backoff:.2f}m 横向{lateral:.2f}m 角度{math.degrees(yaw_offset):.1f}° "
+                f"-> 实发({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)"
+            )
+        else:
+            self.log(f"[导航] 目标已发布: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
 
     def nav_reloc(self, x, y, yaw):
         x, y, yaw = float(x), float(y), float(yaw)

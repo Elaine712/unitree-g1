@@ -3097,6 +3097,22 @@ class MainWindow(QMainWindow):
                     self._log("[导航] 本体到达目标")
                     self._on_goal_done(True)
                 elif nav in ("aborted", "rejected", "preempted", "recalled") and goal_matches:
+                    if nav == "aborted" and self._remote_goal_target and isinstance(data.get("nav_pose"), dict):
+                        try:
+                            gx, gy, _ = self._remote_goal_target
+                            pose = data.get("nav_pose") or {}
+                            dist = math.hypot(float(pose.get("x", 1e9)) - gx, float(pose.get("y", 1e9)) - gy)
+                            accept = float(os.environ.get("HONGTU_NAV_ACCEPT_RADIUS_M", "0.15"))
+                            if dist <= accept:
+                                self._remote_goal_pending = False
+                                self._remote_goal_was_active = False
+                                self._remote_goal_target = None
+                                self._log(f"[导航] 接近目标({dist:.2f}m)，按到达处理")
+                                self._on_nav_status("已到达 ✓")
+                                self._on_goal_done(True)
+                                return
+                        except Exception:
+                            pass
                     self._remote_goal_pending = False
                     self._remote_goal_was_active = False
                     self._remote_goal_target = None
