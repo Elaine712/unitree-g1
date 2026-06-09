@@ -39,17 +39,29 @@ cd "$BASE"
 
 PID_R=""
 PID_L=""
+start_hand_driver_once() {
+    local lr="$1"
+    local ip="$2"
+    local name="$3"
+    if timeout 2 bash -lc "</dev/tcp/${ip}/6000" >/dev/null 2>&1; then
+        echo "[backend] 启动${name}驱动 (${ip})…"
+        python3 inspire_hand_driver.py --lr "$lr" --tcp-ip "$ip" --network "$HONGTU_G1_NET_IF" &
+        if [ "$lr" = "r" ]; then
+            PID_R=$!
+        else
+            PID_L=$!
+        fi
+    else
+        echo "[backend] 跳过${name}驱动：${ip}:6000 不可达（未连接灵巧手时可忽略）"
+    fi
+}
+
 if python3 - <<'PY'
 import pymodbus
 PY
 then
-    echo "[backend] 启动右手驱动 (192.168.123.211)…"
-    python3 inspire_hand_driver.py --lr r --tcp-ip 192.168.123.211 --network "$HONGTU_G1_NET_IF" &
-    PID_R=$!
-
-    echo "[backend] 启动左手驱动 (192.168.123.210)…"
-    python3 inspire_hand_driver.py --lr l --tcp-ip 192.168.123.210 --network "$HONGTU_G1_NET_IF" &
-    PID_L=$!
+    start_hand_driver_once r 192.168.123.211 "右手"
+    start_hand_driver_once l 192.168.123.210 "左手"
 else
     echo "[backend] 跳过灵巧手 Modbus 驱动：未安装 pymodbus"
 fi
