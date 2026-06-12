@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 BASE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME_DIR = os.path.join(BASE, ".runtime")
 LAST_RELOC_FILE = os.path.join(RUNTIME_DIR, "last_success_reloc.json")
+TASK_STATE_FILE = os.path.join(RUNTIME_DIR, "task_state.json")
 for path in (os.path.join(BASE, "unitree_sdk2_python"), os.path.join(BASE, "inspire_hand")):
     if os.path.isdir(path) and path not in sys.path:
         sys.path.insert(0, path)
@@ -72,6 +73,23 @@ COORDINATED_ACTIONS = {
     "x-ray": ("x-ray", "张开"),
     "hands up": ("hands up", "张开"),
 }
+
+
+def default_task_state():
+    now = time.time()
+    return {
+        "task_id": "",
+        "stage": "idle",
+        "target": "",
+        "alarm": "",
+        "nav_goal": None,
+        "detect": {"ok": False, "label": "", "score": None, "xyz": None},
+        "operation": {"name": "", "status": "idle"},
+        "photos": {"before": "", "after": ""},
+        "result": {"ok": None, "message": ""},
+        "updated_at": now,
+        "history": [{"time": now, "stage": "idle", "note": "init"}],
+    }
 
 G1_ARM_JOINT_IDS = [15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
 G1_ARM_PARAMS = [
@@ -208,6 +226,10 @@ class G1Robot:
         self.teleop_stop_event = threading.Event()
         self.teleop_thread = threading.Thread(target=self._teleop_loop, daemon=True)
         self.teleop_thread.start()
+        self.task_lock = threading.RLock()
+        self.task_state = self._load_task_state()
+        if not os.path.exists(TASK_STATE_FILE):
+            self._save_task_state()
         self.hand_ready = False
         self.hand_pub_l = None
         self.hand_pub_r = None
@@ -249,6 +271,54 @@ class G1Robot:
 
     def log(self, msg):
         print(msg, flush=True)
+
+    def _load_task_state(self):
+        try:
+            with open(TASK_STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            state = default_task_state()
+        base = default_task_state()
+        for key, value in base.items():
+            state.setdefault(key, value)
+        for key in ("detect", "operation", "photos", "result"):
+            if not isinstance(state.get(key), dict):
+                state[key] = base[key]
+            else:
+                for sub_key, sub_value in base[key].items():
+                    state[key].setdefault(sub_key, sub_value)
+        return state
+
+    def _save_task_state(self):
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        with open(TASK_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.task_state, f, ensure_ascii=False, indent=2)
+
+    def task_state_snapshot(self):
+        with self.task_lock:
+            return json.loads(json.dumps(self.task_state, ensure_ascii=False))
+
+    def task_update(self, data):
+        now = time.time()
+        with self.task_lock:
+            for key, value in data.items():
+                if key in ("detect", "operation", "photos", "result") and isinstance(value, dict):
+                    self.task_state.setdefault(key, {}).update(value)
+                elif key != "history":
+                    self.task_state[key] = value
+            self.task_state["updated_at"] = now
+            if "stage" in data:
+                history = self.task_state.setdefault("history", [])
+                history.append({"time": now, "stage": self.task_state.get("stage", ""), "note": data.get("note", "")})
+                self.task_state["history"] = history[-30:]
+            self._save_task_state()
+            return self.task_state_snapshot()
+
+    def task_reset(self):
+        with self.task_lock:
+            self.task_state = default_task_state()
+            self._save_task_state()
+            return self.task_state_snapshot()
 
     def connect(self):
         with self.lock:
@@ -338,6 +408,7 @@ class G1Robot:
             "nav_last_reloc_error": self.nav_last_reloc_error,
             "nav_reloc_busy": self.nav_reloc_busy,
             "nav_pose": self.nav_pose,
+            "task": self.task_state_snapshot(),
             "actions": sorted(ARM_ACTIONS.keys()),
         }
 
@@ -1275,6 +1346,7 @@ INDEX_HTML = r"""<!doctype html>
     .pad{display:grid;grid-template-columns:80px 80px 80px;gap:6px;justify-content:center;align-items:center}.pad button{height:48px;margin:0}.pad .wide{grid-column:1/4}
     .swatch{width:42px;height:32px;min-width:42px;border-radius:4px}.sl{display:grid;grid-template-columns:72px 1fr 52px;gap:8px;align-items:center;margin:5px 0}.sl span{font-size:12px;color:var(--muted)}input[type=range]{accent-color:var(--accent);padding:0}
     pre{height:210px;overflow:auto;white-space:pre-wrap;background:#0d1117;border:1px solid var(--line);border-radius:4px;padding:10px;color:#c0c0d0}.mapbox{height:460px;background:#0d1117;border:1px solid var(--line);border-radius:4px;position:relative;overflow:hidden}.mapbox canvas{width:100%;height:100%;display:block}.maphint{position:absolute;left:8px;bottom:8px;background:rgba(0,0,0,.55);padding:4px 7px;border-radius:4px;color:#cbd5e1;font-size:12px}.wp-list{max-height:150px;overflow:auto;background:#0d1117;border:1px solid var(--line);border-radius:4px;padding:6px;font-size:12px}
+    .task-flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:6px}.task-step{border:1px solid var(--line);border-radius:4px;padding:8px;background:#0d1117;text-align:center;font-size:12px;color:var(--muted)}.task-step.active{border-color:var(--accent);color:#fff;background:#1a4080}.photo-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.photo-slot{height:170px;border:1px dashed #58627a;border-radius:4px;background:#0d1117;display:flex;align-items:center;justify-content:center;color:var(--muted);text-align:center;font-size:13px}.kv{display:grid;grid-template-columns:92px 1fr;gap:6px;font-size:13px;margin:5px 0}.kv span:first-child{color:var(--muted)}
     @media(max-width:760px){header{align-items:flex-start;flex-wrap:wrap}.tabs{top:78px}.grid{grid-template-columns:1fr}.row>*{min-width:130px}.pad{grid-template-columns:1fr 1fr 1fr}}
   </style>
 </head>
@@ -1317,6 +1389,33 @@ INDEX_HTML = r"""<!doctype html>
         <section><h2>LED / 音量</h2><div class="row tight" id="leds"></div><label>音量 <span id="volText">100</span>%<input id="vol" type="range" min="0" max="100" value="100" oninput="volText.textContent=this.value" onchange="cmd('/api/volume',{value:+this.value})"></label></section>
       </div>
     </div>
+    <div class="tab" id="tab-task">
+      <div class="grid">
+        <section><h2>任务状态机</h2>
+          <div class="task-flow" id="taskFlow"></div>
+          <div class="row"><input id="taskId" placeholder="任务编号"><input id="taskTarget" placeholder="目标位置/设备"><input id="taskAlarm" placeholder="报警信息"></div>
+          <div class="row"><select id="taskStage"><option value="idle">待命</option><option value="alarm">收到报警</option><option value="navigating">导航中</option><option value="detecting">目标识别</option><option value="operating">执行操作</option><option value="verifying">验收确认</option><option value="returning">返航</option><option value="done">完成</option><option value="failed">失败</option></select><button class="ok" onclick="taskSave()">保存状态</button><button class="danger" onclick="taskReset()">重置</button></div>
+          <textarea id="taskNote" rows="3" placeholder="任务备注 / 人工确认记录"></textarea>
+        </section>
+        <section><h2>检测与操作</h2>
+          <div class="row"><input id="detectLabel" placeholder="检测类别"><input id="detectScore" type="number" step="0.01" placeholder="置信度"><input id="detectXYZ" placeholder="3D 坐标 x,y,z"></div>
+          <div class="row"><input id="opName" placeholder="操作名称"><select id="opStatus"><option value="idle">未开始</option><option value="running">执行中</option><option value="ok">成功</option><option value="failed">失败</option></select><button onclick="taskSaveDetect()">保存检测/操作</button></div>
+          <div class="kv"><span>当前阶段</span><strong id="taskStageText">-</strong></div>
+          <div class="kv"><span>更新时间</span><span id="taskTime">-</span></div>
+          <div class="kv"><span>检测结果</span><span id="taskDetectText">-</span></div>
+          <div class="kv"><span>操作结果</span><span id="taskOpText">-</span></div>
+        </section>
+        <section><h2>操作前后拍照</h2>
+          <div class="photo-grid"><div class="photo-slot" id="photoBefore">操作前照片预留</div><div class="photo-slot" id="photoAfter">操作后照片预留</div></div>
+          <p class="muted">相机接入后这里显示操作前/后照片；当前只保存路径字段到 task_state.json / result.json 结构。</p>
+        </section>
+        <section><h2>result.json 预览</h2>
+          <div class="row"><select id="resultOk"><option value="">待确认</option><option value="true">通过</option><option value="false">失败</option></select><button class="ok" onclick="taskSaveResult()">保存结果</button></div>
+          <textarea id="resultMsg" rows="3" placeholder="验收结论"></textarea>
+          <pre id="taskJson"></pre>
+        </section>
+      </div>
+    </div>
     <div class="tab" id="tab-advanced">
       <div class="grid">
         <section><h2>灵巧手手势</h2><div class="row"><select id="handSide"><option value="r">右手</option><option value="l">左手</option></select><button onclick="handBoth()">双手同步</button></div><div id="hands" class="tight"></div></section>
@@ -1330,7 +1429,8 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </main>
 <script>
-const tabDefs=[["tab-main","导航控制"],["tab-advanced","姿态设置"]];
+const tabDefs=[["tab-main","导航控制"],["tab-task","任务闭环"],["tab-advanced","姿态设置"]];
+const taskStages=[["idle","待命"],["alarm","收到报警"],["navigating","导航中"],["detecting","目标识别"],["operating","执行操作"],["verifying","验收确认"],["returning","返航"],["done","完成"],["failed","失败"]];
 const presets=["张开","握拳","指向","OK","点赞","三指捏","半开","点按"];
 const common=[["face wave","挥手"],["clap","鼓掌"],["hug","拥抱"],["heart","比心"],["right hand up","举手"],["reject","拒绝"],["shake hand","握手"],["x-ray","展示"],["high five","击掌"]];
 const phrases=["欢迎参观","请跟我来","这是我们的展品","谢谢大家","请注意安全","正在前往下一个展品"];
@@ -1381,7 +1481,14 @@ function worldToPix(x,y){let m=webMap;return {x:(x-m.origin[0])/m.resolution,y:m
 function pixToWorld(px,py){let m=webMap;return {x:px*m.resolution+m.origin[0],y:(m.height-1-py)*m.resolution+m.origin[1]}}
 function drawMap(){let c=document.getElementById("mapCanvas");if(!c||!webMap)return;let ctx=c.getContext("2d"),w=webMap.width,h=webMap.height;c.width=w;c.height=h;let img=ctx.createImageData(w,h),p=webMap.pixels;for(let y=0;y<h;y++){for(let x=0;x<w;x++){let g=p[y*w+x],i=(y*w+x)*4;img.data[i]=g;img.data[i+1]=g;img.data[i+2]=g;img.data[i+3]=255}}ctx.putImageData(img,0,0);ctx.fillStyle="#ff6600";waypoints.forEach((wp,i)=>{let q=worldToPix(wp.x,wp.y);ctx.beginPath();ctx.arc(q.x,q.y,5,0,Math.PI*2);ctx.fill();ctx.fillText(String(i+1),q.x+6,q.y-6)});let pose=statusData.nav_pose;if(pose){let q=worldToPix(pose.x,pose.y),yaw=pose.yaw||0;ctx.save();ctx.translate(q.x,q.y);ctx.rotate(-yaw);ctx.fillStyle="#00e5ff";ctx.beginPath();ctx.moveTo(12,0);ctx.lineTo(-8,7);ctx.lineTo(-8,-7);ctx.closePath();ctx.fill();ctx.restore()}}
 mapCanvas.addEventListener("click",ev=>{if(!webMap)return;let r=mapCanvas.getBoundingClientRect(),p=pixToWorld((ev.clientX-r.left)*webMap.width/r.width,(ev.clientY-r.top)*webMap.height/r.height);goalX.value=p.x.toFixed(2);goalY.value=p.y.toFixed(2);drawMap()});
-async function poll(){try{let r=await fetch("/api/status");let j=await r.json();statusData=j.data||{};status.textContent=statusData.ready?"G1: 已连接":"G1: 未连接";status.style.color=statusData.ready?"#a6e3a1":"#f38ba8";detail.textContent=`nav:${statusData.nav||"-"} arm:${statusData.arm_active?"运行":"待机"}`;statusJson.textContent=JSON.stringify(statusData,null,2);if(statusData.actions){allActions.innerHTML=statusData.actions.map(a=>`<button onclick="action('${a}')">${a}</button>`).join("")}drawMap()}catch(e){status.textContent="离线";detail.textContent="---"}}
+function stageName(s){let f=taskStages.find(x=>x[0]===s);return f?f[1]:s}
+function renderTask(t){if(!t)return;taskFlow.innerHTML=taskStages.map(([k,n])=>`<div class="task-step ${t.stage===k?'active':''}">${n}</div>`).join("");taskId.value=t.task_id||"";taskTarget.value=t.target||"";taskAlarm.value=t.alarm||"";taskStage.value=t.stage||"idle";taskStageText.textContent=stageName(t.stage||"idle");taskTime.textContent=t.updated_at?new Date(t.updated_at*1000).toLocaleString():"-";let d=t.detect||{},op=t.operation||{},res=t.result||{},ph=t.photos||{};detectLabel.value=d.label||"";detectScore.value=d.score??"";detectXYZ.value=Array.isArray(d.xyz)?d.xyz.join(","):(d.xyz||"");opName.value=op.name||"";opStatus.value=op.status||"idle";resultOk.value=res.ok===true?"true":res.ok===false?"false":"";resultMsg.value=res.message||"";taskDetectText.textContent=`${d.ok?"已识别":"未确认"} ${d.label||""} ${d.score??""}`;taskOpText.textContent=`${op.name||"-"} / ${op.status||"idle"}`;photoBefore.textContent=ph.before?`操作前: ${ph.before}`:"操作前照片预留";photoAfter.textContent=ph.after?`操作后: ${ph.after}`:"操作后照片预留";taskJson.textContent=JSON.stringify(t,null,2)}
+async function taskUpdate(data){let j=await cmd("/api/task/update",data);if(j.ok)renderTask(j.data)}
+function taskSave(){taskUpdate({task_id:taskId.value,target:taskTarget.value,alarm:taskAlarm.value,stage:taskStage.value,note:taskNote.value})}
+function taskSaveDetect(){let xyz=detectXYZ.value.trim()?detectXYZ.value.split(",").map(x=>+x.trim()):null;taskUpdate({detect:{ok:!!detectLabel.value,label:detectLabel.value,score:detectScore.value===""?null:+detectScore.value,xyz},operation:{name:opName.value,status:opStatus.value}})}
+function taskSaveResult(){let ok=resultOk.value===""?null:resultOk.value==="true";taskUpdate({stage:ok===true?"done":ok===false?"failed":taskStage.value,result:{ok,message:resultMsg.value}})}
+async function taskReset(){let j=await cmd("/api/task/reset");if(j.ok)renderTask(j.data)}
+async function poll(){try{let r=await fetch("/api/status");let j=await r.json();statusData=j.data||{};status.textContent=statusData.ready?"G1: 已连接":"G1: 未连接";status.style.color=statusData.ready?"#a6e3a1":"#f38ba8";detail.textContent=`nav:${statusData.nav||"-"} arm:${statusData.arm_active?"运行":"待机"}`;statusJson.textContent=JSON.stringify(statusData,null,2);if(statusData.actions){allActions.innerHTML=statusData.actions.map(a=>`<button onclick="action('${a}')">${a}</button>`).join("")}renderTask(statusData.task);drawMap()}catch(e){status.textContent="离线";detail.textContent="---"}}
 setInterval(poll,1000);loadMap();poll();
 </script>
 </body>
@@ -1428,6 +1535,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(raw)
             elif path == "/api/status":
                 self._ok(self.robot.status())
+            elif path == "/api/task":
+                self._ok(self.robot.task_state_snapshot())
             elif path == "/api/map":
                 self._ok(load_web_map())
             elif path == "/api/arm/current":
@@ -1498,6 +1607,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/arm/joints":
                 r.arm_set_joints(data.get("joints", []))
                 self._ok()
+            elif path == "/api/task/update":
+                self._ok(r.task_update(data))
+            elif path == "/api/task/reset":
+                self._ok(r.task_reset())
             else:
                 self._error("not found", 404)
         except Exception as e:

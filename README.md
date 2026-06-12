@@ -93,9 +93,13 @@ HongTu/
 │   ├── g1_control_panel.py          # tkinter 综合控制面板
 │   ├── g1_nav_panel/main.py         # PyQt5 导航控制台 (主界面)
 │   ├── g1_arm_hand_coordinator.py   # 手臂+灵巧手协同控制
+│   ├── demo_press_button.py         # 实验室按钮按压演示脚本
 │   ├── g1_xr_motion_test.py         # 手臂运动模式测试
 │   ├── hand_control_panel.py        # 灵巧手独立控制面板
-│   └── inspire_hand_driver.py       # 灵巧手 Modbus 驱动
+│   ├── inspire_hand_driver.py       # 灵巧手 Modbus 驱动
+│   ├── start_pc_remote_gui.sh       # PC 本地 GUI + G1 后台一键启动
+│   ├── start_g1_backend.sh          # G1 本体 HTTP 后台服务
+│   └── setup_hand_relay.sh          # 灵巧手 WiFi 端口转发（按需启动）
 │
 ├── 📂 G1Nav2D/                      # ROS 导航工作空间
 │   ├── client/                      # HTTP 客户端 SDK
@@ -236,6 +240,11 @@ POST /api/nav/start       # 启动导航栈
 POST /api/nav/stop        # 停止导航栈
 POST /api/nav/goal        # 发送导航目标
 POST /api/nav/reloc       # ICP 重定位
+
+# 任务闭环
+GET  /api/task            # 查询任务状态机
+POST /api/task/update     # 更新任务阶段/识别/操作/验收状态
+POST /api/task/reset      # 重置任务状态机
 ```
 
 ### 5. FAST-LIO2 — SLAM 建图与定位
@@ -391,6 +400,9 @@ rosrun map_server map_saver map:=/projected_map -f ~/mymap
 # 使用 Map Eraser Tool 清除动态障碍物
 source devel/setup.bash
 roslaunch ros_map_edit map_edit.launch
+
+# 可选：直接用图片编辑器查看/微调 PGM 地图
+gimp ~/Desktop/G1map.pgm
 ```
 
 #### 7. 启动导航
@@ -398,6 +410,10 @@ roslaunch ros_map_edit map_edit.launch
 ```bash
 # 修改地图路径
 gedit src/fastlio2/config/gridmap_load.launch
+
+# 可选：手动调用 ICP 重定位；GUI/RViz 中常用 2D Pose Estimate 完成同类操作
+source ~/Desktop/HongTu/G1Nav2D/devel/setup.bash
+rosservice call /slam_reloc "{pcd_path: '/home/zgx/Desktop/HongTu/G1Nav2D/src/fastlio2/PCD/map.pcd', x: 0.0, y: 0.0, z: 0.0, roll: 0.0, pitch: 0.0, yaw: 0.0}"
 
 # 启动导航
 source devel/setup.bash
@@ -467,11 +483,11 @@ GUI 和控制进程部署到 G1 本体，PC 通过 SSH X11/VNC/NoMachine 远程�
 ./remote_robot_gui.sh
 ```
 
-> 💡 脚本会自动尝试有线 `192.168.123.164` 和无线 `192.168.1.24`
+> 💡 脚本会自动尝试有线 `192.168.123.164` 和无线 `192.168.13.24`
 
 手动指定：
 ```bash
-G1_HOST=192.168.1.24 ./remote_robot_gui.sh
+G1_HOST=192.168.13.24 ./remote_robot_gui.sh
 ```
 
 #### 方案二：PC 本地 GUI + G1 后台服务
@@ -482,19 +498,58 @@ GUI 在 PC 本地运行，G1 只运行 HTTP 后台服务。
 # 部署到 G1
 ./deploy_to_g1.sh
 
-# G1 本体启动后台服务
+# PC 本地一键启动 GUI，并自动探测/拉起 G1 后台
+./start_pc_remote_gui.sh
+```
+
+启动优先级：
+
+```text
+上次成功 IP → 常用 WiFi IP → 有线 IP → 当前 WiFi 网段自动探测
+```
+
+常用 IP：
+
+```text
+有线: 192.168.123.164
+无线: 192.168.13.24
+```
+
+手动指定：
+
+```bash
+G1_BACKEND_HOST=192.168.13.24 ./start_pc_remote_gui.sh
+G1_BACKEND_HOST=192.168.123.164 ./start_pc_remote_gui.sh
+```
+
+G1 本体后台也可以手动启动：
+
+```bash
 ssh unitree@192.168.123.164
 cd /home/unitree/zgx_g1
 ./start_g1_backend.sh
-
-# PC 本地启动 GUI
-./start_pc_remote_gui.sh
 ```
 
 Web 控制台：
 ```
 http://192.168.13.24:5055/
 ```
+
+> 说明：当前不在 G1 本体设置 HongTu 自启动项。`start_g1_backend.sh` 只在你运行 `start_pc_remote_gui.sh` 或手动启动后台时执行。灵巧手端口转发也只会随后台启动时尝试配置一次，不再通过 crontab 开机自启动。
+
+Web 控制台包含：
+
+- 导航控制：启动/停止导航、地图点选、航点巡航、遥控。
+- 姿态设置：灵巧手、arm_sdk 低阶臂控、后台状态。
+- 任务闭环：报警、导航、识别、操作、验收、返航等状态记录。
+
+任务状态会保存到 G1 本体：
+
+```text
+/home/unitree/zgx_g1/.runtime/task_state.json
+```
+
+当前任务闭环只负责状态记录和结果预览，拍照窗口为预留位；后续接入相机后再写入操作前/后图片路径和 `result.json`。
 
 ---
 
@@ -511,7 +566,7 @@ http://192.168.13.24:5055/
 ```python
 from g1_remote_client import G1RemoteClient
 
-client = G1RemoteClient("192.168.1.24")
+client = G1RemoteClient("http://192.168.13.24:5055")
 client.connect()
 
 # 前进
@@ -533,15 +588,19 @@ client.action("open_arms")  # 展开双臂
 
 **低阶控制 (arm_sdk)**:
 ```python
+from g1_remote_client import G1RemoteClient
+
+client = G1RemoteClient("http://192.168.13.24:5055")
+
 # 激活 arm_sdk
 client.arm_activate()
 
-# 设置关节角度
-client.arm_joints({
-    "right_shoulder_pitch": 0.5,
-    "right_elbow_pitch": -0.3,
-    # ... 其他关节
-})
+# 设置双臂 14 个关节角
+# 顺序: 左臂 7 个 + 右臂 7 个
+client.arm_joints([
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+])
 
 # 释放 arm_sdk
 client.arm_release()
@@ -558,16 +617,16 @@ client.coordinated("wave_hello")
 **预设手势**:
 ```python
 # 右手握拳
-client.hand_preset("right", "fist")
+client.hand_preset("r", "fist")
 
 # 左手张开
-client.hand_preset("left", "open")
+client.hand_preset("l", "open")
 ```
 
 **自定义角度**:
 ```python
 # 设置右手 6 指角度 (0-1000)
-client.hand_angles("right", [500, 300, 800, 700, 600, 500])
+client.hand_angles("r", [500, 300, 800, 700, 600, 500])
 ```
 
 **预设手势列表**:
@@ -635,6 +694,135 @@ client.led(0, 255, 0)    # 绿色
 client.led(0, 0, 255)    # 蓝色
 ```
 
+### 7. 实验室按钮按压演示
+
+演示脚本：
+
+```bash
+demo_press_button.py
+```
+
+用途：
+
+```text
+导航到固定点
+→ 视觉/YOLO 确认目标
+→ 执行手臂预设姿态
+→ 快速执行示教按压动作
+→ 按压后安全抬起
+→ 回初始姿态
+→ 释放 arm_sdk
+```
+
+需要在 `~/Desktop/g1_poses.json` 中保存以下动作名，并同步到 G1：
+
+```text
+按压平举预设动作
+按下动作
+按压后抬起动作
+初始位置
+```
+
+可选动作：
+
+```text
+收手过渡态
+```
+
+同步姿态文件：
+
+```bash
+rsync -az ~/Desktop/g1_poses.json unitree@192.168.13.24:/home/unitree/zgx_g1/g1_poses.json
+```
+
+运行示例：
+
+```bash
+ssh unitree@192.168.13.24 \
+  'cd /home/unitree/zgx_g1 && ./demo_press_button.py --taught-press-duration 0.18 --taught-press-steps 4 --hold-seconds 1'
+```
+
+当前默认流程：
+
+```text
+启动臂控
+→ 收手过渡态
+→ 按压平举预设动作
+→ 按下动作
+→ 保持
+→ 按压后抬起动作
+→ 初始位置
+→ 释放臂控
+```
+
+参数说明：
+
+| 参数 | 说明 |
+|------|------|
+| `--taught-press-duration` | 从按压平举到按下动作的时间，越小越快 |
+| `--taught-press-steps` | 示教按压插值步数，越少越硬 |
+| `--hold-seconds` | 到达按下动作后保持时间 |
+| `--post-press-lift-name` | 按压后安全抬起动作名，默认 `按压后抬起动作` |
+| `--skip-transition-after-lift` | 使用安全抬起后是否跳过收手过渡态，默认 1 |
+
+### 8. 工业拉闸演示
+
+演示脚本：
+
+```bash
+demo_pull_switch.py
+```
+
+用途：
+
+```text
+导航到固定点
+→ YOLO/深度相机确认拉闸位置
+→ 语音播报：检测到电闸未关闭导致漏电，现关闭电闸
+→ 执行接近/抓握/下拉/脱离预设动作
+→ 拍照验收（预留）
+→ 语音播报任务完成
+→ 释放 arm_sdk
+```
+
+需要在 `g1_poses2.json` 中保存以下动作名：
+
+```text
+拉闸接近动作
+拉闸抓握动作
+拉闸下拉动作
+拉闸脱离动作
+初始位置
+```
+
+运行示例：
+
+```bash
+ssh unitree@192.168.13.24 \
+  'cd /home/unitree/zgx_g1 && ./demo_pull_switch.py --speak 1'
+```
+
+> 当前版本按预设动作执行，不做 IK 在线解算；视觉检测和深度坐标用于确认目标和后续微调。
+
+一键方式（PC 端，有线/无线自动探测）：
+
+```bash
+cd ~/Desktop/HongTu
+./run_pull_switch_demo.sh --speak 1
+```
+
+按压脚本同风格手动方式：
+
+```bash
+# 有线
+ssh unitree@192.168.123.164 'cd /home/unitree/zgx_g1 && mkdir -p .runtime && nohup ./start_g1_backend.sh > .runtime/g1_backend.log 2>&1 < /dev/null & sleep 6 && ss -ltn | grep 5055 && pgrep -af g1_robot_service.py'
+ssh unitree@192.168.123.164 'cd /home/unitree/zgx_g1 && ./demo_pull_switch.py --poses g1_poses2.json --speak 1'
+
+# 无线
+ssh unitree@192.168.13.24 'cd /home/unitree/zgx_g1 && mkdir -p .runtime && nohup ./start_g1_backend.sh > .runtime/g1_backend.log 2>&1 < /dev/null & sleep 6 && ss -ltn | grep 5055 && pgrep -af g1_robot_service.py'
+ssh unitree@192.168.13.24 'cd /home/unitree/zgx_g1 && ./demo_pull_switch.py --poses g1_poses2.json --speak 1'
+```
+
 ---
 
 ## 🛡️ 安全机制
@@ -651,9 +839,56 @@ client.led(0, 0, 255)    # 蓝色
 
 | 机制 | 说明 |
 |------|------|
-| **Weight 渐变** | arm_sdk 激活/释放时 0.8 秒渐入渐出 |
+| **Weight 渐变** | arm_sdk 激活/释放时约 1 秒渐入渐出 |
 | **FSM 前置检查** | 模式切换前自动释放 arm_sdk |
 | **Lowstate 检查** | 激活前检查关节状态 |
+| **速度限幅** | arm_sdk 目标角按 250Hz 发布并限速 |
+| **释放前回安全姿态** | 业务脚本先回安全/初始姿态，再释放 arm_sdk |
+
+#### arm_sdk 释放逻辑
+
+`arm_release()` 本身不是“自动回初始位置”，而是：
+
+```text
+arm_sdk weight 平滑降到 0
+停止 arm_sdk 发布线程
+释放低阶臂控
+```
+
+因此安全流程应当是：
+
+```text
+先用关节插值回到安全姿态/初始位置
+再调用 arm_release()
+```
+
+`demo_press_button.py` 当前就是按这个逻辑执行：
+
+```text
+按下动作
+→ 按压后抬起动作
+→ 初始位置
+→ arm_release()
+```
+
+#### 腰部锁定逻辑
+
+当前 arm_sdk 控制的 14 个关节是：
+
+```text
+左臂 7 个: 15-21
+右臂 7 个: 22-28
+```
+
+腰部关节是：
+
+```text
+12 WaistYaw
+13 WaistRoll
+14 WaistPitch
+```
+
+腰部不在 `G1_ARM_JOINT_IDS` 中。后台初始化 LowCmd 时会读取当前全身 `lowstate`，把腰部保持在接管时的位置；后续 `/api/arm/joints` 只更新双臂 14 个关节，不主动改变腰部。
 
 ### 3. 导航安全
 
@@ -684,16 +919,16 @@ client.led(0, 0, 255)    # 蓝色
 ### 网络拓扑
 
 ```
-┌─────────────┐         WiFi          ┌─────────────┐
-│   PC 端      │ ◄──────────────────► │   G1 本体    │
-│ 192.168.1.x │                       │ 192.168.1.24│
-└─────────────┘                       └──────┬──────┘
+┌─────────────┐         WiFi          ┌──────────────┐
+│   PC 端      │ ◄──────────────────► │   G1 本体     │
+│ 192.168.1.x │                       │ 192.168.13.24│
+└─────────────┘                       └──────┬───────┘
                                              │
                               ┌───────────────┼───────────────┐
                               │               │               │
                               ▼               ▼               ▼
                         ┌──────────┐   ┌──────────┐   ┌──────────┐
-                        │ 激光雷达  │   │ 灵巧手   │   │  摄像头   │
+                        │ 激光雷达  │   │  灵巧手   │   │  摄像头   │
                         │ Livox    │   │ Inspire  │   │  Camera  │
                         │ Mid-360  │   │ RH56E2   │   │          │
                         └──────────┘   └──────────┘   └──────────┘
@@ -703,9 +938,97 @@ client.led(0, 0, 255)    # 蓝色
 
 | 设备 | IP 地址 | 用途 |
 |------|---------|------|
-| G1 本体 | 192.168.1.24 | 主机 |
-| Livox 雷达 | 192.168.1.1xx | 激光雷达 |
-| Inspire 灵巧手 | 192.168.123.211 | 灵巧手 |
+| G1 本体（有线） | 192.168.123.164 | SSH/部署/调试 |
+| G1 本体（无线） | 192.168.13.24 | PC GUI / Web / HTTP 后台 |
+| Livox 雷达 | 192.168.123.120 | 激光雷达 |
+| Inspire 左手 | 192.168.123.210:6000 | Modbus TCP |
+| Inspire 右手 | 192.168.123.211:6000 | Modbus TCP |
+
+灵巧手 WiFi 端口转发：
+
+```text
+G1:5021 → 左手 192.168.123.210:6000
+G1:5022 → 右手 192.168.123.211:6000
+```
+
+端口转发不再开机自启动，只会在 `start_g1_backend.sh` 启动时尝试配置一次：
+
+```bash
+HONGTU_SETUP_HAND_RELAY=1 ./start_g1_backend.sh
+```
+
+如需禁用：
+
+```bash
+HONGTU_SETUP_HAND_RELAY=0 ./start_g1_backend.sh
+```
+
+---
+
+## ⚠️ 已知风险与排查点
+
+### 1. 后台自动拉起失败后可能出现空 URL
+
+`start_pc_remote_gui.sh` 会先 HTTP 探测，再 SSH 到 G1 拉起后台。如果 SSH 可连但后台启动失败，脚本会尝试 SSH 隧道；当前隧道失败时仍可能继续打开 GUI，日志中会出现：
+
+```text
+[pc-gui] backend: http://
+```
+
+出现该情况时先手动检查本体后台：
+
+```bash
+ssh unitree@192.168.13.24
+cd /home/unitree/zgx_g1
+tail -80 .runtime/g1_backend.log
+./start_g1_backend.sh
+```
+
+### 2. DDS 网卡名仍依赖本体实际接口
+
+`start_g1_backend.sh` 默认使用：
+
+```bash
+HONGTU_G1_NET_IF=eth0
+```
+
+如果 G1 本体实际 DDS/雷达内网接口变成 `eth1`，后台会报 `eth0: does not match an available interface`。这时不要改系统网卡名，优先临时指定：
+
+```bash
+HONGTU_G1_NET_IF=eth1 ./start_g1_backend.sh
+```
+
+### 3. 导航启动会暂停部分原厂/旧导航进程
+
+为了避免多个节点同时发布 `/cmd_vel`、TF 或定位结果，`g1_robot_service.py` 在启动导航时会清理匹配到的导航、定位和 `/control` 进程。若另一台 PC 正在跑旧版导航，同一时间启动本项目后台导航可能互相影响。
+
+建议现场只保留一套导航栈运行；切换电脑前先停止当前导航：
+
+```bash
+curl -X POST http://192.168.13.24:5055/api/nav/stop
+```
+
+### 4. 灵巧手端口转发会修改本体 iptables
+
+`setup_hand_relay.sh` 是一次性、幂等配置，但会修改：
+
+- `net.ipv4.ip_forward`
+- `iptables` NAT/FORWARD 规则
+
+它不再通过 crontab 自启动，只随 `start_g1_backend.sh` 尝试执行。若不需要 WiFi 转发灵巧手，使用：
+
+```bash
+HONGTU_SETUP_HAND_RELAY=0 ./start_g1_backend.sh
+```
+
+### 5. 按压/拉闸演示仍依赖示教动作质量
+
+`demo_press_button.py` 和 `demo_pull_switch.py` 当前以示教姿态为主。导航误差、目标安装高度、手指接触方向都会影响结果；正式演示前需要确认：
+
+- `g1_poses.json` / `g1_poses2.json` 已按对应任务同步到 G1。
+- 按压后的安全抬起动作不会扫到桌面。
+- 拉闸动作的“脱离动作”先远离墙面，再回初始位置。
+- `arm_sdk` 释放前动作已经回到安全姿态。
 
 ---
 

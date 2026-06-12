@@ -37,6 +37,10 @@ fi
 
 cd "$BASE"
 
+if [ "${HONGTU_SETUP_HAND_RELAY:-1}" = "1" ] && [ -x "${BASE}/setup_hand_relay.sh" ]; then
+    "${BASE}/setup_hand_relay.sh" || echo "[backend] 灵巧手端口转发配置失败（可忽略，不影响非灵巧手功能）"
+fi
+
 PID_R=""
 PID_L=""
 start_hand_driver_once() {

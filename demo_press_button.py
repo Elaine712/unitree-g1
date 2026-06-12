@@ -89,6 +89,39 @@ def send_arm_smooth(client, start, end, duration, steps):
     return list(end)
 
 
+def hold_arm_pose(client, pose, seconds, interval=0.08):
+    end = time.monotonic() + max(0.0, float(seconds))
+    while time.monotonic() < end:
+        client.arm_joints(pose)
+        time.sleep(interval)
+
+
+def max_abs_error(a, b):
+    return max([abs(float(x) - float(y)) for x, y in zip(a, b)] + [0.0])
+
+
+def wait_arm_target(client, pose, seconds, tolerance, interval=0.08):
+    end = time.monotonic() + max(0.0, float(seconds))
+    last_err = None
+    while time.monotonic() < end:
+        client.arm_joints(pose)
+        time.sleep(interval)
+        try:
+            cur = client.arm_current().get("data", {}).get("joints", [])
+            if len(cur) >= len(pose):
+                last_err = max_abs_error(cur[:len(pose)], pose)
+                if last_err <= tolerance:
+                    print(f"[demo] 收手过渡态已到位 err={last_err:.3f}")
+                    return True
+        except Exception as e:
+            print(f"[demo] 读取臂状态失败，继续保持过渡态: {e}")
+    if last_err is None:
+        print("[demo] 收手过渡态保持完成（未读取到关节误差）")
+    else:
+        print(f"[demo] 收手过渡态等待超时 err={last_err:.3f}")
+    return False
+
+
 def parse_coupling(text):
     pairs = []
     for item in (text or "").split(","):
@@ -144,6 +177,7 @@ def main():
     ap.add_argument("--approach-name", default="收手过渡态", help="可选：执行按压预设前先经过的过渡姿态名")
     ap.add_argument("--press-name", default="按压平举预设动作")
     ap.add_argument("--down-name", default="按下动作", help="可选：示教的按下终点姿态名；存在时优先用示教轨迹下压")
+    ap.add_argument("--post-press-lift-name", default="按压后抬起动作", help="可选：按压完成后先到达的安全抬起姿态名")
     ap.add_argument("--transition-name", default="收手过渡态", help="可选：回初始前先经过的过渡姿态名")
     ap.add_argument("--init-name", default="初始位置")
     ap.add_argument("--side", default="r", choices=["l", "r"])
@@ -161,11 +195,20 @@ def main():
     ap.add_argument("--settle", type=float, default=1.2)
     ap.add_argument("--dt", type=float, default=0.10, help="每步下压间隔(s)")
     ap.add_argument("--hold-seconds", type=float, default=0.0, help="到达最大下压/触发压力后停留观察(s)")
+    ap.add_argument("--success-lift", type=float, default=0.12, help="按压成功后先抬高主关节再收手(rad)")
+    ap.add_argument("--success-shoulder-back", type=float, default=0.08, help="按压成功后肩前后关节额外后撤量(rad)，方向不对可设为负数")
+    ap.add_argument("--success-lift-duration", type=float, default=0.8, help="按压成功后抬高手臂时间(s)")
+    ap.add_argument("--success-lift-steps", type=int, default=16, help="按压成功后抬高手臂步数")
+    ap.add_argument("--post-press-return-duration", type=float, default=0.8, help="按压后沿示教轨迹反向抬回按压平举的时间(s)")
+    ap.add_argument("--post-press-return-steps", type=int, default=16, help="按压后沿示教轨迹反向抬回按压平举的步数")
+    ap.add_argument("--skip-transition-after-lift", type=int, default=1, help="使用按压后抬起动作后跳过收手过渡态，1=跳过")
     ap.add_argument("--safe-lift-duration", type=float, default=1.2, help="先收肩到安全位的时间(s)")
     ap.add_argument("--safe-lift-steps", type=int, default=20, help="先收肩到安全位的步数")
     ap.add_argument("--approach-lift-ratio", type=float, default=0.25, help="接近阶段先抬肩比例，0.25 表示只抬到过渡态到按压态差值的 25%")
     ap.add_argument("--approach-duration", type=float, default=1.5, help="过渡态到按压姿态的分段展开时间(s)")
     ap.add_argument("--approach-steps", type=int, default=24, help="过渡态到按压姿态的分段展开步数")
+    ap.add_argument("--transition-hold", type=float, default=1.5, help="到达收手过渡态后保持/等待到位时间(s)")
+    ap.add_argument("--transition-tolerance", type=float, default=0.08, help="收手过渡态到位容差(rad)")
     ap.add_argument("--return-duration", type=float, default=2.0, help="回初始动作插值时间(s)")
     ap.add_argument("--return-steps", type=int, default=30, help="回初始动作插值步数")
     args = ap.parse_args()
@@ -175,6 +218,7 @@ def main():
     approach_pose = load_pose(args.poses, args.approach_name) if args.approach_name else None
     press_pose = load_pose(args.poses, args.press_name)
     down_pose = load_pose_optional(args.poses, args.down_name)
+    post_press_lift_pose = load_pose_optional(args.poses, args.post_press_lift_name)
     transition_pose = load_pose(args.poses, args.transition_name) if args.transition_name else None
     init_pose = load_pose(args.poses, args.init_name)
 
@@ -287,7 +331,28 @@ def main():
             time.sleep(args.hold_seconds)
 
         if pressed and last_target and down_arm:
-            print("[demo] 示教按下完成，保持按下终点")
+            if post_press_lift_pose:
+                print(f"[demo] 示教按下完成，先到安全抬起姿态: {args.post_press_lift_name}")
+                lift_arm = [float(v) for v in post_press_lift_pose.get("arm", [])]
+                if len(lift_arm) != 14:
+                    raise RuntimeError(f"姿态 {args.post_press_lift_name} 的 arm 不是 14 维")
+                current_arm = send_arm_smooth(
+                    client,
+                    last_target,
+                    lift_arm,
+                    args.post_press_return_duration,
+                    args.post_press_return_steps,
+                )
+                wait_arm_target(client, lift_arm, args.transition_hold, args.transition_tolerance)
+            else:
+                print("[demo] 未找到安全抬起姿态，沿按压轨迹反向抬回按压平举")
+                current_arm = send_arm_smooth(
+                    client,
+                    last_target,
+                    base,
+                    args.post_press_return_duration,
+                    args.post_press_return_steps,
+                )
         elif pressed and last_target:
             print("[demo] 压感到阈值，回弹")
             rebound_moved = max(0.0, final_moved - args.rebound)
@@ -305,7 +370,10 @@ def main():
         if current_arm is None:
             current_arm = list(base)
 
-        if transition_pose:
+        skip_transition = bool(args.skip_transition_after_lift and pressed and last_target and down_arm and post_press_lift_pose)
+        if skip_transition:
+            print("[demo] 已完成按压后抬起，跳过收手过渡态")
+        elif transition_pose:
             print(f"[demo] 平滑经过过渡动作: {args.transition_name}")
             transition_arm = [float(v) for v in transition_pose.get("arm", [])]
             if len(transition_arm) != 14:
@@ -313,6 +381,9 @@ def main():
             current_arm = send_arm_smooth(
                 client, current_arm, transition_arm, args.return_duration, args.return_steps
             )
+            if args.transition_hold > 0:
+                print(f"[demo] 等待收手过渡态到位 {args.transition_hold:.1f}s")
+                wait_arm_target(client, transition_arm, args.transition_hold, args.transition_tolerance)
         else:
             print("[demo] 先收肩到安全位")
             safe_arm = list(current_arm)
