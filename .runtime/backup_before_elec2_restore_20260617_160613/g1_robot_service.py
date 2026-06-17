@@ -1,0 +1,1676 @@
+#!/usr/bin/env python3
+"""G1 body-side control service.
+
+Runs on the robot. The PC GUI talks to this service over HTTP, while all
+Unitree DDS/RPC calls stay local to the G1 body.
+"""
+
+import argparse
+import json
+import math
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from enum import IntEnum
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+RUNTIME_DIR = os.path.join(BASE, ".runtime")
+LAST_RELOC_FILE = os.path.join(RUNTIME_DIR, "last_success_reloc.json")
+TASK_STATE_FILE = os.path.join(RUNTIME_DIR, "task_state.json")
+for path in (os.path.join(BASE, "unitree_sdk2_python"), os.path.join(BASE, "inspire_hand")):
+    if os.path.isdir(path) and path not in sys.path:
+        sys.path.insert(0, path)
+
+
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher, ChannelSubscriber
+from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+from unitree_sdk2py.g1.arm.g1_arm_action_client import G1ArmActionClient
+from unitree_sdk2py.g1.arm.g1_arm_action_client import action_map as ARM_ACTIONS
+from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient as G1AudioClient
+from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_
+from unitree_sdk2py.utils.crc import CRC
+
+try:
+    from inspire_sdkpy.inspire_dds import inspire_hand_ctrl as _hand_ctrl_type
+    from inspire_sdkpy.inspire_dds import inspire_hand_state as _hand_state_type
+    from inspire_sdkpy.inspire_hand_defaut import get_inspire_hand_ctrl
+    HAND_OK = True
+except Exception:
+    HAND_OK = False
+    _hand_ctrl_type = None
+    _hand_state_type = None
+    get_inspire_hand_ctrl = None
+
+
+HAND_PRESETS = {
+    "张开": [1000, 1000, 1000, 1000, 1000, 1000],
+    "握拳": [0, 0, 0, 0, 0, 0],
+    "指向": [0, 0, 0, 1000, 0, 500],
+    "OK": [0, 0, 0, 0, 300, 300],
+    "点赞": [0, 0, 0, 0, 1000, 500],
+    "摇滚": [1000, 0, 0, 1000, 1000, 500],
+    "三指捏": [0, 0, 300, 300, 300, 300],
+    "半开": [500, 500, 500, 500, 500, 500],
+    "点按": [0, 0, 0, 800, 0, 500],
+}
+
+COORDINATED_ACTIONS = {
+    "face wave": ("face wave", "张开"),
+    "shake hand": ("shake hand", "握拳"),
+    "clap": ("clap", "张开"),
+    "heart": ("heart", "OK"),
+    "right hand up": ("right hand up", "张开"),
+    "high five": ("high five", "张开"),
+    "hug": ("hug", "半开"),
+    "reject": ("reject", "张开"),
+    "x-ray": ("x-ray", "张开"),
+    "hands up": ("hands up", "张开"),
+}
+
+
+def default_task_state():
+    now = time.time()
+    return {
+        "task_id": "",
+        "stage": "idle",
+        "target": "",
+        "alarm": "",
+        "nav_goal": None,
+        "detect": {"ok": False, "label": "", "score": None, "xyz": None},
+        "operation": {"name": "", "status": "idle"},
+        "photos": {"before": "", "after": ""},
+        "result": {"ok": None, "message": ""},
+        "updated_at": now,
+        "history": [{"time": now, "stage": "idle", "note": "init"}],
+    }
+
+G1_ARM_JOINT_IDS = [15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
+G1_ARM_PARAMS = [
+    {"kp": 80.0, "kd": 3.0, "min": -2.0, "max": 2.0},
+    {"kp": 80.0, "kd": 3.0, "min": -1.5, "max": 1.5},
+    {"kp": 80.0, "kd": 3.0, "min": -2.5, "max": 2.5},
+    {"kp": 80.0, "kd": 3.0, "min": -2.5, "max": 3.0},
+    {"kp": 40.0, "kd": 1.5, "min": -1.5, "max": 1.5},
+    {"kp": 40.0, "kd": 1.5, "min": -1.0, "max": 1.0},
+    {"kp": 40.0, "kd": 1.5, "min": -1.0, "max": 1.0},
+    {"kp": 80.0, "kd": 3.0, "min": -2.0, "max": 2.0},
+    {"kp": 80.0, "kd": 3.0, "min": -1.5, "max": 1.5},
+    {"kp": 80.0, "kd": 3.0, "min": -2.5, "max": 2.5},
+    {"kp": 80.0, "kd": 3.0, "min": -2.5, "max": 3.0},
+    {"kp": 40.0, "kd": 1.5, "min": -1.5, "max": 1.5},
+    {"kp": 40.0, "kd": 1.5, "min": -1.0, "max": 1.0},
+    {"kp": 40.0, "kd": 1.5, "min": -1.0, "max": 1.0},
+]
+G1_ARM_DOF = len(G1_ARM_JOINT_IDS)
+G1_ARM_SDK_ENABLE_JOINT = 29
+
+
+class G1JointIndex(IntEnum):
+    LeftHipPitch = 0
+    LeftHipRoll = 1
+    LeftHipYaw = 2
+    LeftKnee = 3
+    LeftAnklePitch = 4
+    LeftAnkleRoll = 5
+    RightHipPitch = 6
+    RightHipRoll = 7
+    RightHipYaw = 8
+    RightKnee = 9
+    RightAnklePitch = 10
+    RightAnkleRoll = 11
+    WaistYaw = 12
+    WaistRoll = 13
+    WaistPitch = 14
+    LeftShoulderPitch = 15
+    LeftShoulderRoll = 16
+    LeftShoulderYaw = 17
+    LeftElbow = 18
+    LeftWristRoll = 19
+    LeftWristPitch = 20
+    LeftWristYaw = 21
+    RightShoulderPitch = 22
+    RightShoulderRoll = 23
+    RightShoulderYaw = 24
+    RightElbow = 25
+    RightWristRoll = 26
+    RightWristPitch = 27
+    RightWristYaw = 28
+    NotUsedJoint0 = 29
+    NotUsedJoint1 = 30
+    NotUsedJoint2 = 31
+    NotUsedJoint3 = 32
+    NotUsedJoint4 = 33
+    NotUsedJoint5 = 34
+
+
+WEAK_MOTORS = {
+    G1JointIndex.LeftAnklePitch,
+    G1JointIndex.RightAnklePitch,
+    G1JointIndex.LeftShoulderPitch,
+    G1JointIndex.LeftShoulderRoll,
+    G1JointIndex.LeftShoulderYaw,
+    G1JointIndex.LeftElbow,
+    G1JointIndex.RightShoulderPitch,
+    G1JointIndex.RightShoulderRoll,
+    G1JointIndex.RightShoulderYaw,
+    G1JointIndex.RightElbow,
+}
+
+WRIST_MOTORS = {
+    G1JointIndex.LeftWristRoll,
+    G1JointIndex.LeftWristPitch,
+    G1JointIndex.LeftWristYaw,
+    G1JointIndex.RightWristRoll,
+    G1JointIndex.RightWristPitch,
+    G1JointIndex.RightWristYaw,
+}
+
+
+def init_channel(net_if):
+    net_if = (net_if or "").strip()
+    if net_if.lower() == "auto":
+        net_if = detect_net_if()
+    if net_if and net_if.lower() not in ("local", "none"):
+        ChannelFactoryInitialize(0, net_if)
+    else:
+        ChannelFactoryInitialize(0)
+    return net_if or "default"
+
+
+def detect_net_if():
+    try:
+        out = subprocess.check_output(
+            ["ip", "-o", "-4", "addr", "show", "scope", "global"],
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return ""
+    candidates = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        name = parts[1]
+        ip = parts[3].split("/", 1)[0]
+        if name.startswith(("lo", "docker", "br-", "veth")):
+            continue
+        candidates.append((name, ip))
+    for prefix in ("eth", "en", "wlan", "wl"):
+        for name, _ip in candidates:
+            if name.startswith(prefix):
+                return name
+    return candidates[0][0] if candidates else ""
+
+
+class G1Robot:
+    def __init__(self, net_if="auto"):
+        self.net_if = net_if
+        self.lock = threading.RLock()
+        self.ready = False
+        self.loco = None
+        self.arm = None
+        self.audio = None
+        self.tts_index = 1
+        self.last_move_time = 0.0
+        self.moving = False
+        self.teleop_target = (0.0, 0.0, 0.0)
+        self.teleop_continuous = False
+        self.teleop_stop_event = threading.Event()
+        self.teleop_thread = threading.Thread(target=self._teleop_loop, daemon=True)
+        self.teleop_thread.start()
+        self.task_lock = threading.RLock()
+        self.task_state = self._load_task_state()
+        if not os.path.exists(TASK_STATE_FILE):
+            self._save_task_state()
+        self.hand_ready = False
+        self.hand_pub_l = None
+        self.hand_pub_r = None
+        self.hand_state = {"l": {}, "r": {}}
+        self.nav_proc = None
+        self.nav_user_running = False
+        self.nav_bridge_started = False
+        self.nav_status = "stopped"
+        self.nav_last_goal = None
+        self.nav_pose = None
+        self.nav_pcd_path = None
+        self.nav_last_reloc = None
+        self.nav_last_reloc_error = None
+        self.nav_reloc_busy = False
+        self.nav_reloc_pending = None
+        self.nav_reloc_lock = threading.Lock()
+        self.nav_ros_ready = threading.Event()
+        self.nav_goal_pub = None
+        self.nav_cancel_pub = None
+        self.nav_initpose_pub = None
+        self.nav_clear_costmaps = None
+        self.control_paused_for_nav = False
+
+        self.arm_ready = False
+        self.arm_active = False
+        self.arm_pub = None
+        self.arm_cmd = None
+        self.arm_crc = CRC()
+        self.arm_targets = [0.0] * G1_ARM_DOF
+        self.arm_current_cmd_q = [0.0] * G1_ARM_DOF
+        self.arm_weight = 0.0
+        self.arm_publish_dt = 1.0 / 250.0
+        self.arm_velocity_limit = 2.0
+        self.arm_stop_event = threading.Event()
+        self.arm_thread = None
+        self.arm_low_state = None
+        self.arm_low_state_lock = threading.Lock()
+        self.arm_low_state_event = threading.Event()
+        self.arm_cmd_lock = threading.Lock()
+        self.arm_target_lock = threading.Lock()
+
+    def log(self, msg):
+        print(msg, flush=True)
+
+    def _load_task_state(self):
+        try:
+            with open(TASK_STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            state = default_task_state()
+        base = default_task_state()
+        for key, value in base.items():
+            state.setdefault(key, value)
+        for key in ("detect", "operation", "photos", "result"):
+            if not isinstance(state.get(key), dict):
+                state[key] = base[key]
+            else:
+                for sub_key, sub_value in base[key].items():
+                    state[key].setdefault(sub_key, sub_value)
+        return state
+
+    def _save_task_state(self):
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        with open(TASK_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.task_state, f, ensure_ascii=False, indent=2)
+
+    def task_state_snapshot(self):
+        with self.task_lock:
+            return json.loads(json.dumps(self.task_state, ensure_ascii=False))
+
+    def task_update(self, data):
+        now = time.time()
+        with self.task_lock:
+            for key, value in data.items():
+                if key in ("detect", "operation", "photos", "result") and isinstance(value, dict):
+                    self.task_state.setdefault(key, {}).update(value)
+                elif key != "history":
+                    self.task_state[key] = value
+            self.task_state["updated_at"] = now
+            if "stage" in data:
+                history = self.task_state.setdefault("history", [])
+                history.append({"time": now, "stage": self.task_state.get("stage", ""), "note": data.get("note", "")})
+                self.task_state["history"] = history[-30:]
+            self._save_task_state()
+            return self.task_state_snapshot()
+
+    def task_reset(self):
+        with self.task_lock:
+            self.task_state = default_task_state()
+            self._save_task_state()
+            return self.task_state_snapshot()
+
+    def connect(self):
+        with self.lock:
+            if self.ready:
+                return
+            self.log(f"[G1服务] 初始化 DDS: {self.net_if}")
+            self.net_if = init_channel(self.net_if)
+            self.log(f"[G1服务] DDS 实际网卡: {self.net_if}")
+
+            self.loco = LocoClient()
+            self.loco.SetTimeout(10.0)
+            self.loco.Init()
+            self.loco.Start()
+
+            self.arm = G1ArmActionClient()
+            self.arm.SetTimeout(10.0)
+            self.arm.Init()
+
+            self.audio = G1AudioClient()
+            self.audio.SetTimeout(10.0)
+            self.audio.Init()
+            self.audio.SetVolume(100)
+            self._patch_tts()
+
+            self._init_arm_sdk()
+            self._init_hand_dds()
+            self.ready = True
+            self.log("[G1服务] 就绪")
+
+    def _patch_tts(self):
+        def tts(text, speaker_id):
+            self.tts_index += 1
+            payload = {"index": self.tts_index, "text": text, "speaker_id": speaker_id}
+            code, _ = self.audio._Call(1001, json.dumps(payload, ensure_ascii=False))
+            return code
+        self.audio.TtsMaker = tts
+
+    def _init_arm_sdk(self):
+        self.arm_pub = ChannelPublisher("rt/arm_sdk", LowCmd_)
+        self.arm_pub.Init()
+        self.lowstate_sub = ChannelSubscriber("rt/lowstate", LowState_)
+        self.lowstate_sub.Init(self._arm_lowstate_cb, 10)
+        self.arm_ready = True
+        self.log("[G1服务] arm_sdk 就绪")
+
+    def _init_hand_dds(self):
+        if not HAND_OK:
+            self.log("[G1服务] 灵巧手 SDK 不可用，跳过")
+            return
+        try:
+            self.hand_pub_r = ChannelPublisher("rt/inspire_hand/ctrl/r", _hand_ctrl_type)
+            self.hand_pub_r.Init()
+            self.hand_pub_l = ChannelPublisher("rt/inspire_hand/ctrl/l", _hand_ctrl_type)
+            self.hand_pub_l.Init()
+            for lr in ("l", "r"):
+                sub = ChannelSubscriber(f"rt/inspire_hand/state/{lr}", _hand_state_type)
+                sub.Init(lambda msg, side=lr: self._hand_state_update(side, msg), 10)
+            self.hand_ready = True
+            self.log("[G1服务] 灵巧手 DDS 就绪")
+        except Exception as e:
+            self.log(f"[G1服务] 灵巧手 DDS 失败: {e}")
+
+    def _hand_state_update(self, lr, msg):
+        self.hand_state[lr] = {
+            "angle": list(msg.angle_act) if hasattr(msg, "angle_act") else [],
+            "force": list(msg.force_act) if hasattr(msg, "force_act") else [],
+            "pos": list(msg.pos_act) if hasattr(msg, "pos_act") else [],
+        }
+
+    def _require_ready(self):
+        if not self.ready:
+            self.connect()
+
+    def status(self):
+        return {
+            "ready": self.ready,
+            "net_if": self.net_if,
+            "arm_ready": self.arm_ready,
+            "arm_active": self.arm_active,
+            "hand_ready": self.hand_ready,
+            "hand_state": self.hand_state,
+            "moving": self.moving,
+            "nav": self.nav_status,
+            "nav_running": bool(self.nav_user_running and self.nav_proc and self.nav_proc.poll() is None),
+            "nav_last_goal": self.nav_last_goal,
+            "nav_last_reloc": self.nav_last_reloc,
+            "nav_last_reloc_error": self.nav_last_reloc_error,
+            "nav_reloc_busy": self.nav_reloc_busy,
+            "nav_pose": self.nav_pose,
+            "task": self.task_state_snapshot(),
+            "actions": sorted(ARM_ACTIONS.keys()),
+        }
+
+    def _ros_env(self):
+        env = os.environ.copy()
+        env["ROS_MASTER_URI"] = env.get("ROS_MASTER_URI", "http://localhost:11311")
+        return env
+
+    def _pause_control_for_nav(self):
+        if os.environ.get("HONGTU_PAUSE_CONTROL_DURING_NAV", "1").lower() in ("0", "false", "no"):
+            return
+        try:
+            subprocess.run(
+                ["bash", "-lc", "source /opt/ros/noetic/setup.bash 2>/dev/null; rosnode kill /control >/dev/null 2>&1 || true"],
+                check=False,
+                timeout=3,
+            )
+            subprocess.run(["pkill", "-x", "control"], check=False)
+            subprocess.run(["pkill", "-f", "/home/unitree/unitree_robot_g1/modules/control/bin/./control"], check=False)
+            subprocess.run(["pkill", "-f", "/home/unitree/unitree_robot_g1/modules/control/bin/control"], check=False)
+            subprocess.run(["pkill", "-f", "cd /home/unitree/unitree_robot_g1/scripts;./control.sh"], check=False)
+            subprocess.run(["pkill", "-f", "/bin/bash ./control.sh"], check=False)
+            self.control_paused_for_nav = True
+            self.log("[导航] 已暂停本体 /control 零速度发布，避免打断 move_base")
+            time.sleep(0.5)
+        except Exception as e:
+            self.log(f"[导航] 暂停 /control 失败: {e}")
+
+    def _resume_control_after_nav(self):
+        if not self.control_paused_for_nav:
+            return
+        self.control_paused_for_nav = False
+        try:
+            subprocess.Popen(
+                ["bash", "-lc", "cd /home/unitree/unitree_robot_g1/scripts && nohup ./control.sh >/tmp/hongtu_control.log 2>&1 &"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.log("[导航] 已恢复本体 /control")
+        except Exception as e:
+            self.log(f"[导航] 恢复 /control 失败: {e}")
+
+    def _pause_unitree_localization_for_nav(self):
+        """Stop Unitree's default localization TF publishers before HongTu navigation."""
+        if os.environ.get("HONGTU_PAUSE_UNITREE_LOCALIZATION", "1").lower() in ("0", "false", "no"):
+            return
+        patterns = [
+            "roslaunch G1_localization localization_mid360.launch",
+            "/G1_localization/G1_localization",
+            "/G1_localization/global_localization",
+            "/G1_localization/transform_fusion",
+        ]
+        stopped = False
+        for pattern in patterns:
+            try:
+                if subprocess.run(["pgrep", "-f", pattern], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                    stopped = True
+                subprocess.run(["pkill", "-f", pattern], check=False)
+            except Exception:
+                pass
+        if stopped:
+            self.log("[导航] 已暂停 G1 原厂定位 TF，避免与导航定位冲突")
+            time.sleep(0.8)
+
+    def nav_start(self, map_yaml=None, pcd_path=None):
+        with self.lock:
+            if self.nav_proc and self.nav_proc.poll() is None:
+                self.nav_user_running = True
+                self.nav_status = "running"
+                self._pause_control_for_nav()
+                self._start_nav_bridge()
+                if os.environ.get("HONGTU_AUTO_RELOC_ON_NAV_RESTART", "1").lower() not in ("0", "false", "no"):
+                    threading.Thread(target=self.nav_auto_reloc, daemon=True).start()
+                return
+            self._pause_unitree_localization_for_nav()
+            self._cleanup_stale_nav_processes()
+            self._pause_control_for_nav()
+            map_yaml = map_yaml or os.environ.get(
+                "HONGTU_MAP_YAML",
+                os.path.join(BASE, ".runtime", "maps", "G1map.yaml"),
+            )
+            pcd_path = pcd_path or os.environ.get(
+                "HONGTU_PCD_PATH",
+                os.path.join(BASE, "G1Nav2D", "src", "fastlio2", "PCD", "map.pcd"),
+            )
+            if not os.path.exists(map_yaml):
+                raise FileNotFoundError(f"地图 YAML 不存在: {map_yaml}")
+            if not os.path.exists(pcd_path):
+                raise FileNotFoundError(f"PCD 地图不存在: {pcd_path}")
+            self.nav_pcd_path = pcd_path
+            launch_file = os.path.join(BASE, "g1_nav_panel", "nav_start.launch")
+            cmd = ["roslaunch", launch_file, f"map_yaml:={map_yaml}", f"pcd_path:={pcd_path}"]
+            self.log("[导航] 启动: " + " ".join(cmd))
+            self.nav_proc = subprocess.Popen(
+                cmd,
+                env=self._ros_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN),
+            )
+            threading.Thread(target=self._nav_log_loop, daemon=True).start()
+            self.nav_user_running = True
+            self.nav_status = "starting"
+            self._start_nav_bridge()
+            if os.environ.get("HONGTU_AUTO_RELOC", "1").lower() not in ("0", "false", "no"):
+                threading.Thread(target=self.nav_auto_reloc, daemon=True).start()
+
+    def _nav_is_running(self):
+        return bool(self.nav_proc and self.nav_proc.poll() is None)
+
+    def _cleanup_stale_nav_processes(self):
+        patterns = [
+            os.path.join(BASE, "g1_nav_panel", "nav_start.launch"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "livox_ros_driver2", "livox_ros_driver2_node"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "fastlio", "localizer_node"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "fastlio", "slam_reloc.py"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "tool", "downsample_pointcloud"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "tool", "body2any_pointcloud"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "xju_pnc", "costmap_clear"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "pointcloud_to_laserscan", "pointcloud_to_laserscan_node"),
+            os.path.join(BASE, "G1Nav2D", "devel", "lib", "velocity_smoother_ema", "velocity_smoother_ema_node"),
+            "/opt/ros/noetic/lib/move_base/move_base cmd_vel:=/cmd_vel odom:=slam_odom",
+            os.path.join(BASE, ".runtime", "maps", "G1map.yaml"),
+            "body base_link 100",
+        ]
+        for pattern in patterns:
+            try:
+                subprocess.run(["pkill", "-f", pattern], check=False)
+            except Exception:
+                pass
+        time.sleep(0.3)
+
+    def _nav_log_loop(self):
+        proc = self.nav_proc
+        if not proc or not proc.stdout:
+            return
+        for line in iter(proc.stdout.readline, ""):
+            self.log("[nav] " + line.rstrip())
+        self.nav_status = "stopped"
+        self.nav_user_running = False
+        self._reset_nav_bridge_state()
+        self.log("[导航] 进程已退出")
+
+    def _reset_nav_bridge_state(self):
+        self.nav_bridge_started = False
+        self.nav_ros_ready.clear()
+        self.nav_goal_pub = None
+        self.nav_cancel_pub = None
+        self.nav_initpose_pub = None
+        self.nav_clear_costmaps = None
+        self.nav_pose = None
+
+    def nav_stop(self):
+        with self.lock:
+            self.ensure_arm_released("停止导航前")
+            keep_ros = os.environ.get("HONGTU_NAV_STOP_KEEP_ROS", "1").lower() not in ("0", "false", "no")
+            if keep_ros and self.nav_proc and self.nav_proc.poll() is None:
+                try:
+                    if self.nav_cancel_pub:
+                        from actionlib_msgs.msg import GoalID
+                        self.nav_cancel_pub.publish(GoalID())
+                except Exception as e:
+                    self.log(f"[导航] 取消 move_base goal 失败: {e}")
+                self.nav_user_running = False
+                self.nav_status = "stopped"
+                self.nav_last_goal = None
+                if self.ready:
+                    threading.Thread(target=self.stop, daemon=True).start()
+                threading.Thread(target=self._resume_control_after_nav, daemon=True).start()
+                self.log("[导航] 已软停止：保留 ROS 导航栈，便于再次启动和自动重定位")
+                return
+            if self.nav_proc and self.nav_proc.poll() is None:
+                self.nav_proc.terminate()
+                try:
+                    self.nav_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.nav_proc.kill()
+            self.nav_proc = None
+            self.nav_user_running = False
+            self.nav_status = "stopped"
+            self._reset_nav_bridge_state()
+            if self.ready:
+                try:
+                    self.stop()
+                except Exception:
+                    pass
+            self._cleanup_stale_nav_processes()
+            self._resume_control_after_nav()
+
+    def _start_nav_bridge(self):
+        if self.nav_bridge_started:
+            return
+        self.nav_bridge_started = True
+        threading.Thread(target=self._nav_bridge_loop, daemon=True).start()
+
+    def _nav_bridge_loop(self):
+        try:
+            import rospy
+            from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
+            from actionlib_msgs.msg import GoalID, GoalStatusArray
+            from nav_msgs.msg import Odometry
+            from std_srvs.srv import Empty
+            import tf2_ros
+
+            if not rospy.core.is_initialized():
+                rospy.init_node("hongtu_g1_backend_nav", anonymous=True, disable_signals=True)
+
+            tf_buffer = tf2_ros.Buffer()
+            tf2_ros.TransformListener(tf_buffer)
+            self.nav_goal_pub = rospy.Publisher("/move_base_simple/goal", PoseStamped, queue_size=1)
+            self.nav_cancel_pub = rospy.Publisher("/move_base/cancel", GoalID, queue_size=1)
+            self.nav_initpose_pub = rospy.Publisher("/initialpose", PoseWithCovarianceStamped, queue_size=1)
+            self.nav_clear_costmaps = rospy.ServiceProxy("/move_base/clear_costmaps", Empty)
+
+            def cmd_cb(msg):
+                if abs(msg.linear.x) < 0.001 and abs(msg.linear.y) < 0.001 and abs(msg.angular.z) < 0.001:
+                    self.stop()
+                else:
+                    self.move(msg.linear.x, msg.linear.y, msg.angular.z, continuous=True)
+
+            def status_cb(msg):
+                if msg.status_list:
+                    status_map = {0: "pending", 1: "active", 2: "preempted", 3: "succeeded", 4: "aborted", 5: "rejected", 8: "recalled"}
+                    self.nav_status = status_map.get(msg.status_list[-1].status, str(msg.status_list[-1].status))
+
+            def odom_cb(msg):
+                q = msg.pose.pose.orientation
+                x = msg.pose.pose.position.x
+                y = msg.pose.pose.position.y
+                siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+                cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+                yaw = math.atan2(siny_cosp, cosy_cosp)
+                try:
+                    t = tf_buffer.lookup_transform("map", "body", rospy.Time(0), rospy.Duration(0.05))
+                    x = t.transform.translation.x
+                    y = t.transform.translation.y
+                    tq = t.transform.rotation
+                    siny_cosp = 2.0 * (tq.w * tq.z + tq.x * tq.y)
+                    cosy_cosp = 1.0 - 2.0 * (tq.y * tq.y + tq.z * tq.z)
+                    yaw = math.atan2(siny_cosp, cosy_cosp)
+                except Exception:
+                    pass
+                self.nav_pose = {
+                    "x": x,
+                    "y": y,
+                    "yaw": yaw,
+                    "stamp": time.time(),
+                }
+
+            nav_cmd_bridge = os.environ.get("HONGTU_NAV_CMD_BRIDGE", "0").lower() in ("1", "true", "yes")
+            if nav_cmd_bridge:
+                # Optional fallback for systems without the native /g1_robot cmd_vel bridge.
+                rospy.Subscriber("/cmd_vel_smooth", Twist, cmd_cb, queue_size=10)
+                self.log("[导航] cmd_vel_smooth DDS 桥接已启动")
+            else:
+                self.log("[导航] 使用本体 /g1_robot 原生 cmd_vel 控制，后台不重复转发速度")
+            rospy.Subscriber("/move_base/status", GoalStatusArray, status_cb, queue_size=10)
+            rospy.Subscriber("/slam_odom", Odometry, odom_cb, queue_size=10)
+            self.nav_ros_ready.set()
+            rospy.spin()
+        except Exception as e:
+            self.log(f"[导航] cmd_vel 桥接失败: {e}")
+            self._reset_nav_bridge_state()
+
+    def _wait_nav_ros(self):
+        self._start_nav_bridge()
+        if not self.nav_ros_ready.wait(timeout=3.0):
+            raise RuntimeError("导航 ROS 桥接未就绪")
+
+    def _wait_slam_reloc(self, timeout=20.0):
+        import rospy
+        from fastlio.srv import SlamReLoc, SlamRelocCheck
+
+        rospy.wait_for_service("/slam_reloc", timeout=timeout)
+        rospy.wait_for_service("/slam_reloc_check", timeout=timeout)
+        return (
+            rospy.ServiceProxy("/slam_reloc", SlamReLoc),
+            rospy.ServiceProxy("/slam_reloc_check", SlamRelocCheck),
+        )
+
+    def _ensure_nav_goal_ready(self):
+        if not self._nav_is_running():
+            raise RuntimeError("导航未启动：请先调用 /api/nav/start")
+        self._wait_nav_ros()
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            if not self._nav_is_running():
+                raise RuntimeError("导航进程已退出，请查看 G1 后台日志")
+            if self.nav_goal_pub and self.nav_goal_pub.get_num_connections() > 0:
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("move_base 未就绪：/move_base_simple/goal 暂无订阅者")
+
+        pose_deadline = time.time() + 20.0
+        while time.time() < pose_deadline:
+            if not self._nav_is_running():
+                raise RuntimeError("导航进程已退出，请查看 G1 后台日志")
+            if self.nav_pose and (time.time() - float(self.nav_pose.get("stamp", 0))) < 3.0:
+                return
+            time.sleep(0.2)
+        raise RuntimeError("定位未就绪：未收到新鲜 /slam_odom")
+
+    def _publish_nav_msg(self, pub, msg, name, repeat=5):
+        if pub is None:
+            raise RuntimeError(f"{name} publisher 未就绪")
+        deadline = time.time() + 2.0
+        while pub.get_num_connections() == 0 and time.time() < deadline:
+            time.sleep(0.05)
+        if pub.get_num_connections() == 0:
+            self.log(f"[导航] {name} 暂无订阅者，仍尝试发布")
+        for _ in range(repeat):
+            pub.publish(msg)
+            time.sleep(0.05)
+
+    def nav_goal(self, x, y, yaw):
+        self._ensure_nav_goal_ready()
+        import rospy
+        from geometry_msgs.msg import PoseStamped
+
+        target_x, target_y, target_yaw = float(x), float(y), float(yaw)
+        backoff = float(os.environ.get("HONGTU_NAV_GOAL_BACKOFF_M", "0"))
+        lateral = float(os.environ.get("HONGTU_NAV_GOAL_LATERAL_M", "0"))
+        yaw_offset = math.radians(float(os.environ.get("HONGTU_NAV_GOAL_YAW_OFFSET_DEG", "0")))
+        yaw = target_yaw + yaw_offset
+        x, y = target_x, target_y
+        if abs(backoff) > 1e-6 or abs(lateral) > 1e-6:
+            x = target_x - backoff * math.cos(yaw)
+            y = target_y - backoff * math.sin(yaw)
+            x += lateral * -math.sin(yaw)
+            y += lateral * math.cos(yaw)
+        msg = PoseStamped()
+        msg.header.frame_id = "map"
+        msg.header.stamp = rospy.Time.now()
+        msg.pose.position.x = x
+        msg.pose.position.y = y
+        msg.pose.position.z = 0.0
+        msg.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.orientation.w = math.cos(yaw / 2.0)
+        try:
+            self.nav_clear_costmaps()
+        except Exception as e:
+            self.log(f"[导航] 清除代价地图失败: {e}")
+        self._publish_nav_msg(self.nav_goal_pub, msg, "goal")
+        self.nav_last_goal = {
+            "x": target_x,
+            "y": target_y,
+            "yaw": target_yaw,
+            "sent_x": x,
+            "sent_y": y,
+            "sent_yaw": yaw,
+            "backoff": backoff,
+            "lateral": lateral,
+            "yaw_offset_deg": math.degrees(yaw_offset),
+        }
+        self.nav_status = "goal_sent"
+        if abs(backoff) > 1e-6 or abs(lateral) > 1e-6 or abs(yaw_offset) > 1e-6:
+            self.log(
+                f"[导航] 目标已发布: 原始({target_x:.2f}, {target_y:.2f}) "
+                f"前后{backoff:.2f}m 横向{lateral:.2f}m 角度{math.degrees(yaw_offset):.1f}° "
+                f"-> 实发({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)"
+            )
+        else:
+            self.log(f"[导航] 目标已发布: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+
+    def nav_reloc(self, x, y, yaw):
+        x, y, yaw = float(x), float(y), float(yaw)
+        if not self._nav_is_running():
+            self.log("[重定位] 导航未运行，自动启动导航以执行 ICP")
+            self.nav_start()
+        self._wait_nav_ros()
+
+        with self.nav_reloc_lock:
+            self.nav_last_reloc = {"x": x, "y": y, "yaw": yaw, "queued": True}
+            self.nav_last_reloc_error = None
+            self.nav_status = "reloc_pending"
+            if self.nav_reloc_busy:
+                self.nav_reloc_pending = (x, y, yaw)
+                self.log(f"[重定位] 正在执行 ICP，已合并为最新请求: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+                return
+            self.nav_reloc_busy = True
+
+        threading.Thread(target=self._nav_reloc_worker, args=(x, y, yaw), daemon=True).start()
+        self.log(f"[重定位] 已排队后台执行: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+
+    def _load_last_reloc_pose(self):
+        try:
+            with open(LAST_RELOC_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return float(data["x"]), float(data["y"]), float(data["yaw"])
+        except Exception:
+            return None
+
+    def _save_last_reloc_pose(self, x, y, yaw):
+        try:
+            os.makedirs(RUNTIME_DIR, exist_ok=True)
+            data = {"x": float(x), "y": float(y), "yaw": float(yaw), "yaw_deg": math.degrees(float(yaw)), "time": time.time()}
+            with open(LAST_RELOC_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.log(f"[重定位] 保存成功位姿失败: {e}")
+
+    def _parse_reloc_candidates(self):
+        candidates = []
+        last = self._load_last_reloc_pose()
+        if last:
+            candidates.append(last)
+            self.log(f"[重定位] 自动候选包含上次成功位姿: ({last[0]:.2f}, {last[1]:.2f}, {math.degrees(last[2]):.0f}°)")
+
+        raw = os.environ.get("HONGTU_AUTO_RELOC_CANDIDATES", "").strip()
+        if raw:
+            for item in raw.split(";"):
+                parts = [p.strip() for p in item.split(",") if p.strip()]
+                if len(parts) != 3:
+                    continue
+                try:
+                    candidates.append((float(parts[0]), float(parts[1]), math.radians(float(parts[2]))))
+                except Exception:
+                    self.log(f"[重定位] 忽略无效候选: {item}")
+
+        x = float(os.environ.get("HONGTU_START_X", "0.0"))
+        y = float(os.environ.get("HONGTU_START_Y", "0.0"))
+        yaw = math.radians(float(os.environ.get("HONGTU_START_YAW_DEG", "132")))
+        candidates.append((x, y, yaw))
+        return candidates
+
+    def _expanded_reloc_candidates(self):
+        xy_step = float(os.environ.get("HONGTU_AUTO_RELOC_XY_STEP", "0.3"))
+        yaw_step = float(os.environ.get("HONGTU_AUTO_RELOC_YAW_STEP_DEG", "15"))
+        max_tries = int(os.environ.get("HONGTU_AUTO_RELOC_MAX_TRIES", "40"))
+        xy_offsets = [(0.0, 0.0), (xy_step, 0.0), (-xy_step, 0.0), (0.0, xy_step), (0.0, -xy_step)]
+        yaw_offsets = [0.0, yaw_step, -yaw_step, yaw_step * 2.0, -yaw_step * 2.0]
+        seen = set()
+        out = []
+        for x, y, yaw in self._parse_reloc_candidates():
+            for dx, dy in xy_offsets:
+                for dyaw_deg in yaw_offsets:
+                    item = (x + dx, y + dy, yaw + math.radians(dyaw_deg))
+                    key = (round(item[0], 2), round(item[1], 2), round(math.degrees(item[2])))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(item)
+                    if len(out) >= max_tries:
+                        return out
+        return out
+
+    def _nav_reloc_worker(self, x, y, yaw):
+        current = (x, y, yaw)
+        try:
+            while current:
+                try:
+                    self._nav_reloc_once(*current)
+                except Exception as e:
+                    self.nav_last_reloc_error = str(e)
+                    self.nav_status = "reloc_failed"
+                    self.log(f"[重定位] 后台执行失败: {e}")
+                with self.nav_reloc_lock:
+                    current = self.nav_reloc_pending
+                    self.nav_reloc_pending = None
+                    if not current:
+                        self.nav_reloc_busy = False
+                        break
+                    self.nav_last_reloc = {"x": current[0], "y": current[1], "yaw": current[2], "queued": True}
+                    self.nav_status = "reloc_pending"
+        finally:
+            with self.nav_reloc_lock:
+                self.nav_reloc_busy = False
+
+    def _nav_reloc_once(self, x, y, yaw, fallback_initialpose=True):
+        self._wait_nav_ros()
+        import rospy
+        from geometry_msgs.msg import PoseWithCovarianceStamped
+
+        pcd_path = self.nav_pcd_path or os.environ.get(
+            "HONGTU_PCD_PATH",
+            os.path.join(BASE, "G1Nav2D", "src", "fastlio2", "PCD", "map.pcd"),
+        )
+        icp_ok = False
+        try:
+            reloc_srv, check_srv = self._wait_slam_reloc()
+            resp = reloc_srv(pcd_path, x, y, 0.0, 0.0, 0.0, yaw)
+            self.log(f"[重定位] ICP 服务已调用: status={getattr(resp, 'status', None)} msg={getattr(resp, 'message', '')}")
+            deadline = time.time() + 12.0
+            while time.time() < deadline:
+                chk = check_srv()
+                if getattr(chk, "status", 0):
+                    icp_ok = True
+                    break
+                time.sleep(0.2)
+        except Exception as e:
+            self.log(f"[重定位] ICP 服务失败，降级 initialpose: {e}")
+            self.nav_last_reloc_error = str(e)
+
+        if icp_ok:
+            self._save_last_reloc_pose(x, y, yaw)
+            self.log(f"[重定位] ICP 重定位成功: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)，已保存为下次优先候选")
+            self.log("[重定位] ICP 已成功，跳过 initialpose，使用 FAST-LIO 校准后的 map->body 位姿")
+        elif fallback_initialpose:
+            msg = PoseWithCovarianceStamped()
+            msg.header.frame_id = "map"
+            msg.header.stamp = rospy.Time.now()
+            msg.pose.pose.position.x = x
+            msg.pose.pose.position.y = y
+            msg.pose.pose.position.z = 0.0
+            msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+            msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+            self._publish_nav_msg(self.nav_initpose_pub, msg, "initialpose")
+            self.log(f"[重定位] initialpose 已发布: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+        try:
+            self.nav_clear_costmaps()
+        except Exception as e:
+            self.log(f"[导航] 清除代价地图失败: {e}")
+        self.nav_status = "reloc_sent"
+        self.nav_last_reloc = {"x": x, "y": y, "yaw": yaw, "queued": False}
+        self.log(f"[重定位] 完成: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°) icp_ok={icp_ok}")
+        return icp_ok
+
+    def nav_auto_reloc(self):
+        try:
+            time.sleep(float(os.environ.get("HONGTU_AUTO_RELOC_DELAY", "6")))
+            with self.nav_reloc_lock:
+                if self.nav_reloc_busy:
+                    self.log("[重定位] 自动重定位跳过：已有重定位任务在执行")
+                    return
+                self.nav_reloc_busy = True
+            candidates = self._expanded_reloc_candidates()
+            self.log(f"[重定位] 自动重定位开始，共 {len(candidates)} 个候选")
+            last_error = None
+            try:
+                for i, (x, y, yaw) in enumerate(candidates, 1):
+                    self.log(f"[重定位] 自动尝试 {i}/{len(candidates)}: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+                    try:
+                        self.nav_status = "reloc_pending"
+                        self.nav_last_reloc = {"x": x, "y": y, "yaw": yaw, "queued": True, "auto": True}
+                        if self._nav_reloc_once(x, y, yaw, fallback_initialpose=False):
+                            self.log(f"[重定位] 自动重定位成功: 使用候选 {i}/{len(candidates)}")
+                            return
+                    except Exception as e:
+                        last_error = str(e)
+                        self.log(f"[重定位] 自动候选失败: {e}")
+                self.nav_last_reloc_error = last_error or "all candidates failed"
+                self.nav_status = "reloc_failed"
+                self.log("[重定位] 自动重定位失败：所有候选 ICP 未成功，请手动拖拽重定位")
+            finally:
+                with self.nav_reloc_lock:
+                    self.nav_reloc_busy = False
+        except Exception as e:
+            with self.nav_reloc_lock:
+                self.nav_reloc_busy = False
+            self.log(f"[重定位] 自动重定位失败: {e}")
+
+    def ensure_arm_released(self, reason=""):
+        if self.arm_active:
+            self.log(f"[安全] {reason or '切换控制前'}，释放 arm_sdk")
+            self.arm_release()
+
+    def move(self, vx, vy, wz, continuous=False):
+        with self.lock:
+            self._require_ready()
+            vx, vy, wz = float(vx), float(vy), float(wz)
+            self.last_move_time = time.time()
+            self.moving = abs(vx) > 1e-4 or abs(vy) > 1e-4 or abs(wz) > 1e-4
+            self.teleop_target = (vx, vy, wz)
+            self.teleop_continuous = bool(continuous and self.moving)
+            if self.moving and not self.teleop_continuous:
+                self.loco.Move(vx, vy, wz, continous_move=bool(continuous))
+            elif not self.moving:
+                self.loco.StopMove()
+
+    def stop(self):
+        with self.lock:
+            self._require_ready()
+            self.moving = False
+            self.teleop_target = (0.0, 0.0, 0.0)
+            self.teleop_continuous = False
+            self.loco.StopMove()
+
+    def _teleop_loop(self):
+        interval = float(os.environ.get("HONGTU_TELEOP_DT", "0.05"))
+        timeout = float(os.environ.get("HONGTU_TELEOP_TIMEOUT", "0.45"))
+        while not self.teleop_stop_event.is_set():
+            time.sleep(interval)
+            try:
+                with self.lock:
+                    if not self.ready or not self.teleop_continuous:
+                        continue
+                    vx, vy, wz = self.teleop_target
+                    if time.time() - self.last_move_time > timeout:
+                        self.moving = False
+                        self.teleop_target = (0.0, 0.0, 0.0)
+                        self.teleop_continuous = False
+                        self.loco.StopMove()
+                        continue
+                    self.loco.Move(vx, vy, wz, continous_move=True)
+            except Exception:
+                pass
+
+    def stand(self):
+        with self.lock:
+            self.ensure_arm_released("切换站立/行走前")
+            self._require_ready()
+            self.loco.Start()
+
+    def fsm(self, fsm_id):
+        with self.lock:
+            self.ensure_arm_released("切换 FSM 模式前")
+            self._require_ready()
+            self.loco.SetFsmId(int(fsm_id))
+
+    def action(self, name=None, action_id=None):
+        with self.lock:
+            self.ensure_arm_released("执行预设动作前")
+            self._require_ready()
+            if action_id is None:
+                if name not in ARM_ACTIONS:
+                    raise ValueError(f"未知动作: {name}")
+                action_id = ARM_ACTIONS[name]
+            self.arm.ExecuteAction(int(action_id))
+
+    def speak(self, text, speaker_id=0):
+        text = (text or "").strip()
+        if not text:
+            return
+        with self.lock:
+            self._require_ready()
+            try:
+                self.audio.SetTimeout(2.0)
+            except Exception:
+                pass
+            code = self.audio.TtsMaker(text, int(speaker_id))
+            try:
+                self.audio.SetTimeout(10.0)
+            except Exception:
+                pass
+            if code not in (0, None):
+                raise RuntimeError(f"AudioClient TTS 返回错误码: {code}")
+
+    def volume(self, value):
+        with self.lock:
+            self._require_ready()
+            self.audio.SetVolume(max(0, min(100, int(value))))
+
+    def led(self, r, g, b):
+        with self.lock:
+            self._require_ready()
+            self.audio.LedControl(int(r), int(g), int(b))
+
+    def hand_preset(self, lr, preset):
+        if preset not in HAND_PRESETS:
+            raise ValueError(f"未知手势: {preset}")
+        self.hand_angles(lr, HAND_PRESETS[preset])
+
+    def hand_angles(self, lr, angles):
+        with self.lock:
+            self._require_ready()
+            if not self.hand_ready:
+                raise RuntimeError("灵巧手 DDS 未就绪")
+            if lr not in ("l", "r"):
+                raise ValueError("lr must be l or r")
+            if len(angles) != 6:
+                raise ValueError("灵巧手角度需要 6 个值")
+            pub = self.hand_pub_r if lr == "r" else self.hand_pub_l
+            cmd = get_inspire_hand_ctrl()
+            cmd.mode = 0b0001
+            cmd.angle_set = [int(max(0, min(1000, v))) for v in angles]
+            pub.Write(cmd)
+
+    def coordinated_action(self, name):
+        if name not in COORDINATED_ACTIONS:
+            self.action(name=name)
+            return
+        arm_name, hand_preset = COORDINATED_ACTIONS[name]
+        self.action(name=arm_name)
+        try:
+            self.hand_preset("r", hand_preset)
+        except Exception as e:
+            self.log(f"[协同] 灵巧手失败: {e}")
+
+    def _arm_lowstate_cb(self, msg):
+        with self.arm_low_state_lock:
+            self.arm_low_state = msg
+        self.arm_low_state_event.set()
+
+    def _arm_current_lowstate(self):
+        with self.arm_low_state_lock:
+            return self.arm_low_state
+
+    def arm_current(self):
+        state = self._arm_current_lowstate()
+        if not state:
+            raise RuntimeError("无 rt/lowstate 数据")
+        return [float(state.motor_state[jid].q) for jid in G1_ARM_JOINT_IDS]
+
+    def _arm_prepare_cmd_from_lowstate(self):
+        state = self._arm_current_lowstate()
+        if not state:
+            return False
+        cmd = unitree_hg_msg_dds__LowCmd_()
+        cmd.mode_pr = 0
+        cmd.mode_machine = state.mode_machine
+        arm_set = set(G1_ARM_JOINT_IDS)
+        for joint in G1JointIndex:
+            idx = int(joint)
+            motor = cmd.motor_cmd[idx]
+            motor.mode = 1
+            motor.q = float(state.motor_state[idx].q)
+            motor.dq = 0.0
+            motor.tau = 0.0
+            if idx in arm_set:
+                if joint in WRIST_MOTORS:
+                    motor.kp = 40.0
+                    motor.kd = 1.5
+                else:
+                    motor.kp = 80.0
+                    motor.kd = 3.0
+            elif joint in WEAK_MOTORS:
+                motor.kp = 80.0
+                motor.kd = 3.0
+            else:
+                motor.kp = 300.0
+                motor.kd = 3.0
+        cmd.motor_cmd[G1_ARM_SDK_ENABLE_JOINT].q = float(self.arm_weight)
+        with self.arm_cmd_lock:
+            self.arm_cmd = cmd
+        with self.arm_target_lock:
+            self.arm_current_cmd_q = [float(state.motor_state[jid].q) for jid in G1_ARM_JOINT_IDS]
+        return True
+
+    def _arm_clip_targets(self, targets):
+        max_step = max(self.arm_velocity_limit * self.arm_publish_dt, 1e-6)
+        next_q = []
+        for cur, tgt in zip(self.arm_current_cmd_q, targets):
+            delta = float(tgt) - float(cur)
+            if delta > max_step:
+                delta = max_step
+            elif delta < -max_step:
+                delta = -max_step
+            next_q.append(float(cur) + delta)
+        self.arm_current_cmd_q = next_q
+        return next_q
+
+    def _arm_publish_once(self):
+        if not self.arm_ready or not self.arm_pub:
+            return
+        with self.arm_cmd_lock:
+            cmd = self.arm_cmd
+        if cmd is None:
+            return
+        with self.arm_target_lock:
+            targets = list(self.arm_targets)
+            weight = float(self.arm_weight)
+            clipped = self._arm_clip_targets(targets)
+        with self.arm_cmd_lock:
+            cmd.motor_cmd[G1_ARM_SDK_ENABLE_JOINT].q = weight
+            for i, jid in enumerate(G1_ARM_JOINT_IDS):
+                motor = cmd.motor_cmd[jid]
+                motor.q = float(clipped[i])
+                motor.dq = 0.0
+                motor.tau = 0.0
+                motor.kp = G1_ARM_PARAMS[i]["kp"]
+                motor.kd = G1_ARM_PARAMS[i]["kd"]
+            cmd.crc = self.arm_crc.Crc(cmd)
+            self.arm_pub.Write(cmd)
+
+    def _arm_publish_loop(self):
+        while not self.arm_stop_event.is_set():
+            start = time.time()
+            try:
+                self._arm_publish_once()
+            except Exception as e:
+                self.log(f"[姿态] arm_sdk 发布异常: {e}")
+            sleep_time = self.arm_publish_dt - (time.time() - start)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    def _arm_start_loop(self):
+        if self.arm_thread and self.arm_thread.is_alive():
+            return
+        self.arm_stop_event.clear()
+        self.arm_thread = threading.Thread(target=self._arm_publish_loop, daemon=True)
+        self.arm_thread.start()
+
+    def _arm_stop_loop(self):
+        self.arm_stop_event.set()
+        if self.arm_thread and self.arm_thread.is_alive():
+            self.arm_thread.join(timeout=1.0)
+        self.arm_thread = None
+
+    def _arm_ramp_weight(self, start, end, seconds=1.0):
+        steps = max(1, int(seconds / 0.02))
+        for step in range(steps + 1):
+            ratio = step / steps
+            with self.arm_target_lock:
+                self.arm_weight = float(start + (end - start) * ratio)
+            self._arm_publish_once()
+            time.sleep(0.02)
+
+    def arm_activate(self):
+        with self.lock:
+            self._require_ready()
+            if not self.arm_ready:
+                raise RuntimeError("arm_sdk 未就绪")
+            if self.arm_active:
+                return self.arm_current()
+            if not self.arm_low_state_event.wait(timeout=2.0):
+                raise RuntimeError("未收到 rt/lowstate，禁止激活臂控")
+            current = self.arm_current()
+            with self.arm_target_lock:
+                self.arm_targets = list(current)
+                self.arm_current_cmd_q = list(current)
+                self.arm_weight = 0.0
+            if not self._arm_prepare_cmd_from_lowstate():
+                raise RuntimeError("LowCmd 初始化失败，禁止激活臂控")
+            self.arm_active = True
+            self._arm_start_loop()
+            self._arm_ramp_weight(0.0, 1.0, seconds=1.0)
+            return current
+
+    def arm_release(self):
+        try:
+            if self.arm_ready and self.arm_cmd is not None:
+                self._arm_ramp_weight(float(self.arm_weight), 0.0, seconds=1.0)
+        finally:
+            self._arm_stop_loop()
+            self.arm_active = False
+            with self.arm_target_lock:
+                self.arm_weight = 0.0
+
+    def arm_set_joints(self, joints):
+        values = [float(v) for v in joints]
+        if len(values) != G1_ARM_DOF:
+            raise ValueError(f"需要 {G1_ARM_DOF} 个关节角")
+        with self.lock:
+            self._require_ready()
+            if not self.arm_active:
+                raise RuntimeError("arm_sdk 未激活")
+            with self.arm_target_lock:
+                for i, val in enumerate(values):
+                    lo = G1_ARM_PARAMS[i]["min"]
+                    hi = G1_ARM_PARAMS[i]["max"]
+                    self.arm_targets[i] = max(lo, min(hi, val))
+
+    def shutdown(self):
+        try:
+            self.nav_stop()
+        except Exception:
+            pass
+        if self.ready:
+            try:
+                self.stop()
+            except Exception:
+                pass
+        if self.arm_ready or self.arm_active:
+            try:
+                self.arm_release()
+            except Exception:
+                pass
+
+
+def watchdog(robot, timeout):
+    while True:
+        time.sleep(0.1)
+        try:
+            if robot.moving and time.time() - robot.last_move_time > timeout:
+                robot.log("[安全] 遥控超时，自动 StopMove")
+                robot.stop()
+        except Exception as e:
+            robot.log(f"[安全] watchdog 异常: {e}")
+
+
+def _parse_simple_yaml(path):
+    values = {}
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.split("#", 1)[0].strip()
+            if not line or ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            values[k.strip()] = v.strip().strip("'\"")
+    return values
+
+
+def _read_pgm(path):
+    with open(path, "rb") as f:
+        def token():
+            out = bytearray()
+            while True:
+                ch = f.read(1)
+                if not ch:
+                    return None
+                if ch == b"#":
+                    f.readline()
+                    continue
+                if ch.isspace():
+                    if out:
+                        return bytes(out)
+                    continue
+                out.extend(ch)
+
+        magic = token()
+        if magic not in (b"P5", b"P2"):
+            raise ValueError(f"不支持的地图格式: {magic!r}")
+        w, h, maxval = int(token()), int(token()), int(token())
+        if maxval <= 0 or maxval > 255:
+            raise ValueError(f"不支持的 PGM maxval: {maxval}")
+        if magic == b"P5":
+            pixels = list(f.read(w * h))
+        else:
+            pixels = [int(token()) for _ in range(w * h)]
+        if len(pixels) != w * h:
+            raise ValueError("PGM 像素数据长度不匹配")
+        return w, h, pixels
+
+
+def load_web_map():
+    yaml_path = os.environ.get("HONGTU_MAP_YAML", os.path.join(BASE, ".runtime", "maps", "G1map.yaml"))
+    meta = _parse_simple_yaml(yaml_path)
+    image = meta.get("image")
+    if not image:
+        raise ValueError("地图 YAML 缺少 image 字段")
+    if not os.path.isabs(image):
+        image = os.path.abspath(os.path.join(os.path.dirname(yaml_path), image))
+    w, h, pixels = _read_pgm(image)
+    origin = [float(x.strip()) for x in meta.get("origin", "[0,0,0]").strip("[]").split(",") if x.strip()]
+    while len(origin) < 3:
+        origin.append(0.0)
+    return {
+        "width": w,
+        "height": h,
+        "resolution": float(meta.get("resolution", 0.05)),
+        "origin": origin[:3],
+        "pixels": pixels,
+        "yaml": yaml_path,
+    }
+
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>G1 导航控制台</title>
+  <style>
+    :root{--bg:#1a1a2e;--panel:#16213e;--panel2:#0f172a;--line:#3a3a5c;--accent:#e94560;--blue:#0f3460;--text:#e0e0e0;--muted:#a8b0c5;--ok:#27ae60;--danger:#c0392b;--warn:#e67e22}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    header{display:flex;align-items:center;gap:12px;padding:10px 12px;background:#111827;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:3}
+    h1{font-size:18px;margin:0;color:#fff}.status{font-size:13px;font-weight:700;padding:5px 10px;border-radius:4px;background:var(--panel);color:var(--muted);white-space:nowrap}
+    .spacer{flex:1}.tabs{display:flex;gap:2px;overflow:auto;background:#10162a;border-bottom:1px solid var(--line);position:sticky;top:49px;z-index:2}
+    .tab-btn{border:0;border-radius:0;background:#1a1a2e;color:#9ca3af;padding:11px 18px;font-weight:700;white-space:nowrap}.tab-btn.active{background:var(--blue);color:var(--accent)}
+    main{padding:10px}.tab{display:none}.tab.active{display:block}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:10px}
+    section{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px}h2{margin:0 0 10px;color:var(--accent);font-size:13px}
+    button,input,textarea,select{font:inherit}button{background:linear-gradient(#16213e,#0f3460);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:8px 12px;margin:3px;cursor:pointer}
+    button:hover{border-color:var(--accent);background:#1a4080}button.ok{background:linear-gradient(#27ae60,#1e8449);border-color:#2ecc71;color:white;font-weight:700}
+    button.danger{background:linear-gradient(#c0392b,#96281b);border-color:#e74c3c;color:white;font-weight:700}button.warn{background:linear-gradient(#e67e22,#a75d12);border-color:#f59e0b;color:white;font-weight:700}
+    input,textarea,select{width:100%;background:#0d1117;color:var(--text);border:1px solid var(--line);border-radius:4px;padding:8px;margin:3px 0}
+    textarea{resize:vertical}.row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.row>*{flex:1}.tight button{min-width:76px}.muted{font-size:12px;color:var(--muted)}
+    .pad{display:grid;grid-template-columns:80px 80px 80px;gap:6px;justify-content:center;align-items:center}.pad button{height:48px;margin:0}.pad .wide{grid-column:1/4}
+    .swatch{width:42px;height:32px;min-width:42px;border-radius:4px}.sl{display:grid;grid-template-columns:72px 1fr 52px;gap:8px;align-items:center;margin:5px 0}.sl span{font-size:12px;color:var(--muted)}input[type=range]{accent-color:var(--accent);padding:0}
+    pre{height:210px;overflow:auto;white-space:pre-wrap;background:#0d1117;border:1px solid var(--line);border-radius:4px;padding:10px;color:#c0c0d0}.mapbox{height:460px;background:#0d1117;border:1px solid var(--line);border-radius:4px;position:relative;overflow:hidden}.mapbox canvas{width:100%;height:100%;display:block}.maphint{position:absolute;left:8px;bottom:8px;background:rgba(0,0,0,.55);padding:4px 7px;border-radius:4px;color:#cbd5e1;font-size:12px}.wp-list{max-height:150px;overflow:auto;background:#0d1117;border:1px solid var(--line);border-radius:4px;padding:6px;font-size:12px}
+    .task-flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:6px}.task-step{border:1px solid var(--line);border-radius:4px;padding:8px;background:#0d1117;text-align:center;font-size:12px;color:var(--muted)}.task-step.active{border-color:var(--accent);color:#fff;background:#1a4080}.photo-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.photo-slot{height:170px;border:1px dashed #58627a;border-radius:4px;background:#0d1117;display:flex;align-items:center;justify-content:center;color:var(--muted);text-align:center;font-size:13px}.kv{display:grid;grid-template-columns:92px 1fr;gap:6px;font-size:13px;margin:5px 0}.kv span:first-child{color:var(--muted)}
+    @media(max-width:760px){header{align-items:flex-start;flex-wrap:wrap}.tabs{top:78px}.grid{grid-template-columns:1fr}.row>*{min-width:130px}.pad{grid-template-columns:1fr 1fr 1fr}}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>G1 导航控制台</h1>
+    <span id="status" class="status">未连接</span>
+    <span id="detail" class="status">---</span>
+    <span class="spacer"></span>
+    <button class="ok" onclick="cmd('/api/connect')">连接 G1</button>
+    <button class="danger" onclick="cmd('/api/stop')">急停</button>
+  </header>
+  <nav class="tabs" id="tabs"></nav>
+  <main>
+    <div class="tab active" id="tab-main">
+      <div class="grid">
+        <section><h2>导航</h2>
+          <div class="row tight"><button class="ok" onclick="cmd('/api/nav/start')">启动导航</button><button class="danger" onclick="cmd('/api/nav/stop')">停止导航</button><button onclick="poll()">刷新状态</button></div>
+          <div class="row"><input id="goalX" type="number" step="0.01" placeholder="目标 X"><input id="goalY" type="number" step="0.01" placeholder="目标 Y"><input id="goalYaw" type="number" step="1" placeholder="朝向 °"></div>
+          <div class="row tight"><button onclick="navGoal()">发送导航目标</button><button onclick="navReloc()">重定位</button><button onclick="addWaypoint()">添加航点</button></div>
+          <div class="mapbox"><canvas id="mapCanvas"></canvas><div class="maphint">点击地图填入目标点，机器人位置随状态刷新</div></div>
+        </section>
+        <section><h2>航点</h2>
+          <div class="row"><input id="wpFile" type="file" accept=".json,application/json"><button onclick="startCruise()">开始巡航</button><button onclick="stopCruise()">停止巡航</button></div>
+          <div id="wpList" class="wp-list">未加载航点</div>
+          <p class="muted">支持 PC GUI 导出的 JSON；也可在地图点击目标后添加航点。</p>
+        </section>
+        <section><h2>遥控</h2>
+          <div class="row"><label>线速度<input id="lin" type="range" min="0" max="100" value="30"></label><label>角速度<input id="ang" type="range" min="0" max="100" value="50"></label></div>
+          <div class="pad">
+            <span></span><button data-move="1,0,0">前进</button><span></span>
+            <button data-move="0,1,0">左移</button><button class="danger" onclick="stop()">停止</button><button data-move="0,-1,0">右移</button>
+            <button data-move="0,0,1">左转</button><button data-move="-1,0,0">后退</button><button data-move="0,0,-1">右转</button>
+          </div>
+        </section>
+        <section><h2>FSM 模式</h2><div class="row tight"><button onclick="cmd('/api/stand')">行走模式</button><button onclick="fsm(1)">阻尼模式</button><button onclick="fsm(3)">坐下</button><button onclick="cmd('/api/stop')">停止移动</button></div></section>
+        <section><h2>常用动作</h2><div id="commonActions" class="tight"></div></section>
+        <section><h2>全部动作</h2><div id="allActions" class="tight"></div></section>
+        <section><h2>语音播报</h2><textarea id="tts" rows="4" placeholder="输入中文播报内容"></textarea><button class="ok" onclick="speak(tts.value)">播报</button><div id="phrases" class="tight"></div></section>
+        <section><h2>LED / 音量</h2><div class="row tight" id="leds"></div><label>音量 <span id="volText">100</span>%<input id="vol" type="range" min="0" max="100" value="100" oninput="volText.textContent=this.value" onchange="cmd('/api/volume',{value:+this.value})"></label></section>
+      </div>
+    </div>
+    <div class="tab" id="tab-task">
+      <div class="grid">
+        <section><h2>任务状态机</h2>
+          <div class="task-flow" id="taskFlow"></div>
+          <div class="row"><input id="taskId" placeholder="任务编号"><input id="taskTarget" placeholder="目标位置/设备"><input id="taskAlarm" placeholder="报警信息"></div>
+          <div class="row"><select id="taskStage"><option value="idle">待命</option><option value="alarm">收到报警</option><option value="navigating">导航中</option><option value="detecting">目标识别</option><option value="operating">执行操作</option><option value="verifying">验收确认</option><option value="returning">返航</option><option value="done">完成</option><option value="failed">失败</option></select><button class="ok" onclick="taskSave()">保存状态</button><button class="danger" onclick="taskReset()">重置</button></div>
+          <textarea id="taskNote" rows="3" placeholder="任务备注 / 人工确认记录"></textarea>
+        </section>
+        <section><h2>检测与操作</h2>
+          <div class="row"><input id="detectLabel" placeholder="检测类别"><input id="detectScore" type="number" step="0.01" placeholder="置信度"><input id="detectXYZ" placeholder="3D 坐标 x,y,z"></div>
+          <div class="row"><input id="opName" placeholder="操作名称"><select id="opStatus"><option value="idle">未开始</option><option value="running">执行中</option><option value="ok">成功</option><option value="failed">失败</option></select><button onclick="taskSaveDetect()">保存检测/操作</button></div>
+          <div class="kv"><span>当前阶段</span><strong id="taskStageText">-</strong></div>
+          <div class="kv"><span>更新时间</span><span id="taskTime">-</span></div>
+          <div class="kv"><span>检测结果</span><span id="taskDetectText">-</span></div>
+          <div class="kv"><span>操作结果</span><span id="taskOpText">-</span></div>
+        </section>
+        <section><h2>操作前后拍照</h2>
+          <div class="photo-grid"><div class="photo-slot" id="photoBefore">操作前照片预留</div><div class="photo-slot" id="photoAfter">操作后照片预留</div></div>
+          <p class="muted">相机接入后这里显示操作前/后照片；当前只保存路径字段到 task_state.json / result.json 结构。</p>
+        </section>
+        <section><h2>result.json 预览</h2>
+          <div class="row"><select id="resultOk"><option value="">待确认</option><option value="true">通过</option><option value="false">失败</option></select><button class="ok" onclick="taskSaveResult()">保存结果</button></div>
+          <textarea id="resultMsg" rows="3" placeholder="验收结论"></textarea>
+          <pre id="taskJson"></pre>
+        </section>
+      </div>
+    </div>
+    <div class="tab" id="tab-advanced">
+      <div class="grid">
+        <section><h2>灵巧手手势</h2><div class="row"><select id="handSide"><option value="r">右手</option><option value="l">左手</option></select><button onclick="handBoth()">双手同步</button></div><div id="hands" class="tight"></div></section>
+        <section><h2>自定义角度</h2><div id="handSliders"></div><button class="ok" onclick="sendHandAngles()">发送角度</button></section>
+        <section><h2>arm_sdk 低阶臂控</h2><div class="row"><button class="warn" onclick="armActivate()">激活臂控</button><button class="danger" onclick="armRelease()">释放臂控</button><button onclick="armRead()">读取当前姿态</button><button onclick="armZero()">归零</button></div><p class="muted">执行预设动作、FSM 切换、站立前，后台会自动释放 arm_sdk。</p></section>
+        <section><h2>双臂关节</h2><div id="armSliders"></div><button class="ok" onclick="sendArm()">发送当前关节</button></section>
+        <section><h2>后台状态</h2><pre id="statusJson"></pre></section>
+        <section><h2>日志</h2><pre id="log"></pre></section>
+        <section><h2>连接信息</h2><p class="muted">默认端口 5055。若浏览器不能直连，请在 PC 运行 start_pc_remote_gui.sh 自动建立 SSH 隧道，然后访问 http://127.0.0.1:15055/。</p><button onclick="poll()">刷新状态</button></section>
+      </div>
+    </div>
+  </main>
+<script>
+const tabDefs=[["tab-main","导航控制"],["tab-task","任务闭环"],["tab-advanced","姿态设置"]];
+const taskStages=[["idle","待命"],["alarm","收到报警"],["navigating","导航中"],["detecting","目标识别"],["operating","执行操作"],["verifying","验收确认"],["returning","返航"],["done","完成"],["failed","失败"]];
+const presets=["张开","握拳","指向","OK","点赞","三指捏","半开","点按"];
+const common=[["face wave","挥手"],["clap","鼓掌"],["hug","拥抱"],["heart","比心"],["right hand up","举手"],["reject","拒绝"],["shake hand","握手"],["x-ray","展示"],["high five","击掌"]];
+const phrases=["欢迎参观","请跟我来","这是我们的展品","谢谢大家","请注意安全","正在前往下一个展品"];
+const leds=[["红",255,0,0,"#ff3333"],["绿",0,255,0,"#33cc33"],["蓝",0,0,255,"#3366ff"],["白",255,255,255,"#fff"],["关",0,0,0,"#555"]];
+const armNames=["左肩前后","左肩左右","左肩旋转","左肘","左腕旋转","左腕俯仰","左腕偏航","右肩前后","右肩左右","右肩旋转","右肘","右腕旋转","右腕俯仰","右腕偏航"];
+const armRanges=[[-2,2],[-1.5,1.5],[-2.5,2.5],[-2.5,3],[-1.5,1.5],[-1,1],[-1,1],[-2,2],[-1.5,1.5],[-2.5,2.5],[-2.5,3],[-1.5,1.5],[-1,1],[-1,1]];
+const fingerNames=["小指","无名指","中指","食指","拇指屈","拇指旋"];
+let arm=Array(14).fill(0), hand=Array(6).fill(500), statusData={}, webMap=null, waypoints=[], cruise=false, cruiseIndex=0;
+tabs.innerHTML=tabDefs.map((t,i)=>`<button class="tab-btn ${i?'':'active'}" onclick="showTab('${t[0]}',this)">${t[1]}</button>`).join("");
+commonActions.innerHTML=common.map(([a,c])=>`<button onclick="action('${a}')">${c}</button>`).join("");
+allActions.innerHTML=common.map(([a,c])=>`<button onclick="action('${a}')">${a}</button>`).join("");
+phrases.innerHTML=phrases.map(p=>`<button onclick="speak('${p}')">${p}</button>`).join("");
+leds.innerHTML=leds.map(([n,r,g,b,c])=>`<button class="swatch" style="background:${c};color:${n==='白'?'#111':'#fff'}" onclick="cmd('/api/led',{r:${r},g:${g},b:${b}})">${n}</button>`).join("");
+hands.innerHTML=presets.map(p=>`<button onclick="handPreset('${p}')">${p}</button>`).join("");
+armSliders.innerHTML=armNames.map((n,i)=>`<div class="sl"><span>${n}</span><input id="arm${i}" type="range" min="${armRanges[i][0]*100}" max="${armRanges[i][1]*100}" value="0" oninput="setArm(${i},this.value/100)"><span id="armv${i}">0.00</span></div>`).join("");
+handSliders.innerHTML=fingerNames.map((n,i)=>`<div class="sl"><span>${n}</span><input id="hand${i}" type="range" min="0" max="1000" value="500" oninput="setHand(${i},+this.value)"><span id="handv${i}">500</span></div>`).join("");
+document.querySelectorAll("[data-move]").forEach(b=>{
+  let v=b.dataset.move.split(",").map(Number), hold=false, timer=null, loop=null;
+  function down(ev){ev.preventDefault();hold=false;timer=setTimeout(()=>{hold=true;move(v[0],v[1],v[2],true);loop=setInterval(()=>move(v[0],v[1],v[2],true),180)},220)}
+  function up(ev){ev.preventDefault();clearTimeout(timer);clearInterval(loop);if(hold){stop()}else{stepMove(v[0],v[1],v[2])}}
+  ["mousedown","touchstart","pointerdown"].forEach(e=>b.addEventListener(e,down));
+  ["mouseup","mouseleave","touchend","touchcancel","pointerup","pointercancel"].forEach(e=>b.addEventListener(e,up));
+});
+wpFile.addEventListener("change",loadWaypointsFile);
+function showTab(id,btn){document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));document.getElementById(id).classList.add("active");document.querySelectorAll(".tab-btn").forEach(x=>x.classList.remove("active"));btn.classList.add("active")}
+function add(s){log.textContent=(new Date().toLocaleTimeString()+" "+s+"\n"+log.textContent).slice(0,6000)}
+async function cmd(path,data={}){try{let r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});let j=await r.json();add((j.ok?"OK ":"ERR ")+path+" "+JSON.stringify(j.data||j.error||{}));await poll();return j}catch(e){add("失败 "+path+" "+e);return {ok:false,error:String(e)}}}
+function move(x,y,z,continuous=false){let lin=+document.getElementById("lin").value/100,ang=+document.getElementById("ang").value/100;return cmd("/api/move",{vx:x*lin,vy:y*lin,wz:z*ang,continuous})}
+function stepMove(x,y,z){move(x,y,z,true);setTimeout(stop,360)}
+function stop(){cmd("/api/stop")}function fsm(id){cmd("/api/fsm",{id})}function action(name){cmd("/api/coordinated",{name})}function speak(text){cmd("/api/speak",{text:text||""})}
+function yawRad(){return (+goalYaw.value||0)*Math.PI/180}function navGoal(){cmd("/api/nav/goal",{x:+goalX.value||0,y:+goalY.value||0,yaw:yawRad()})}function navReloc(){cmd("/api/nav/reloc",{x:+goalX.value||0,y:+goalY.value||0,yaw:yawRad()})}
+function addWaypoint(){let wp={name:"航点"+(waypoints.length+1),x:+goalX.value||0,y:+goalY.value||0,yaw:yawRad()};waypoints.push(wp);renderWaypoints()}
+async function loadWaypointsFile(){let f=wpFile.files&&wpFile.files[0];if(!f)return;let txt=await f.text();let data=JSON.parse(txt);let arr=Array.isArray(data)?data:(data.waypoints||data.points||[]);waypoints=arr.map((w,i)=>({name:w.name||w.label||("航点"+(i+1)),x:+(w.x??w[1]??0),y:+(w.y??w[2]??0),yaw:+(w.yaw??w[3]??0)}));renderWaypoints();add("航点加载 "+waypoints.length+" 个")}
+function renderWaypoints(){wpList.innerHTML=waypoints.length?waypoints.map((w,i)=>`<div><button onclick="sendWaypoint(${i})">${i+1}</button> ${w.name} (${w.x.toFixed(2)}, ${w.y.toFixed(2)})</div>`).join(""):"未加载航点";drawMap()}
+function sendWaypoint(i){let w=waypoints[i];if(!w)return;goalX.value=w.x.toFixed(2);goalY.value=w.y.toFixed(2);goalYaw.value=Math.round((w.yaw||0)*180/Math.PI);return cmd("/api/nav/goal",{x:w.x,y:w.y,yaw:w.yaw||0})}
+async function waitNavDone(timeout=180000){let end=Date.now()+timeout;while(cruise&&Date.now()<end){await new Promise(r=>setTimeout(r,1200));await poll();let n=statusData.nav;if(["succeeded","aborted","rejected","preempted","recalled","stopped"].includes(n))return n}return "timeout"}
+async function startCruise(){if(!waypoints.length)return add("未加载航点");cruise=true;cruiseIndex=0;while(cruise&&cruiseIndex<waypoints.length){add("巡航 "+(cruiseIndex+1)+"/"+waypoints.length);await sendWaypoint(cruiseIndex++);let n=await waitNavDone();add("航点结果 "+n);if(n!=="succeeded")break}cruise=false}
+function stopCruise(){cruise=false;cmd("/api/nav/stop")}
+function handPreset(preset){cmd("/api/hand/preset",{lr:handSide.value,preset})}function handBoth(){presets.forEach(()=>{});cmd("/api/hand/angles",{lr:"l",angles:hand});cmd("/api/hand/angles",{lr:"r",angles:hand})}
+function setHand(i,v){hand[i]=v;document.getElementById("handv"+i).textContent=v}function sendHandAngles(){cmd("/api/hand/angles",{lr:handSide.value,angles:hand})}
+function setArm(i,v){arm[i]=+v;document.getElementById("armv"+i).textContent=(+v).toFixed(2)}function sendArm(){cmd("/api/arm/joints",{joints:arm})}
+async function armActivate(){let j=await cmd("/api/arm/activate");let joints=j.data&&j.data.joints;if(joints){arm=joints.slice(0,14);syncArm()}}
+function armRelease(){cmd("/api/arm/release")}function armZero(){arm=Array(14).fill(0);syncArm();sendArm()}
+async function armRead(){try{let r=await fetch("/api/arm/current");let j=await r.json();if(j.ok&&j.data.joints){arm=j.data.joints.slice(0,14);syncArm();add("OK 读取当前姿态")}}catch(e){add("读取失败 "+e)}}
+function syncArm(){arm.forEach((v,i)=>{let s=document.getElementById("arm"+i),l=document.getElementById("armv"+i);if(s){s.value=Math.round(v*100);l.textContent=(+v).toFixed(2)}})}
+async function loadMap(){try{let r=await fetch("/api/map");let j=await r.json();if(j.ok){webMap=j.data;drawMap();add("地图加载 "+webMap.width+"x"+webMap.height)}}catch(e){add("地图加载失败 "+e)}}
+function worldToPix(x,y){let m=webMap;return {x:(x-m.origin[0])/m.resolution,y:m.height-1-(y-m.origin[1])/m.resolution}}
+function pixToWorld(px,py){let m=webMap;return {x:px*m.resolution+m.origin[0],y:(m.height-1-py)*m.resolution+m.origin[1]}}
+function drawMap(){let c=document.getElementById("mapCanvas");if(!c||!webMap)return;let ctx=c.getContext("2d"),w=webMap.width,h=webMap.height;c.width=w;c.height=h;let img=ctx.createImageData(w,h),p=webMap.pixels;for(let y=0;y<h;y++){for(let x=0;x<w;x++){let g=p[y*w+x],i=(y*w+x)*4;img.data[i]=g;img.data[i+1]=g;img.data[i+2]=g;img.data[i+3]=255}}ctx.putImageData(img,0,0);ctx.fillStyle="#ff6600";waypoints.forEach((wp,i)=>{let q=worldToPix(wp.x,wp.y);ctx.beginPath();ctx.arc(q.x,q.y,5,0,Math.PI*2);ctx.fill();ctx.fillText(String(i+1),q.x+6,q.y-6)});let pose=statusData.nav_pose;if(pose){let q=worldToPix(pose.x,pose.y),yaw=pose.yaw||0;ctx.save();ctx.translate(q.x,q.y);ctx.rotate(-yaw);ctx.fillStyle="#00e5ff";ctx.beginPath();ctx.moveTo(12,0);ctx.lineTo(-8,7);ctx.lineTo(-8,-7);ctx.closePath();ctx.fill();ctx.restore()}}
+mapCanvas.addEventListener("click",ev=>{if(!webMap)return;let r=mapCanvas.getBoundingClientRect(),p=pixToWorld((ev.clientX-r.left)*webMap.width/r.width,(ev.clientY-r.top)*webMap.height/r.height);goalX.value=p.x.toFixed(2);goalY.value=p.y.toFixed(2);drawMap()});
+function stageName(s){let f=taskStages.find(x=>x[0]===s);return f?f[1]:s}
+function renderTask(t){if(!t)return;taskFlow.innerHTML=taskStages.map(([k,n])=>`<div class="task-step ${t.stage===k?'active':''}">${n}</div>`).join("");taskId.value=t.task_id||"";taskTarget.value=t.target||"";taskAlarm.value=t.alarm||"";taskStage.value=t.stage||"idle";taskStageText.textContent=stageName(t.stage||"idle");taskTime.textContent=t.updated_at?new Date(t.updated_at*1000).toLocaleString():"-";let d=t.detect||{},op=t.operation||{},res=t.result||{},ph=t.photos||{};detectLabel.value=d.label||"";detectScore.value=d.score??"";detectXYZ.value=Array.isArray(d.xyz)?d.xyz.join(","):(d.xyz||"");opName.value=op.name||"";opStatus.value=op.status||"idle";resultOk.value=res.ok===true?"true":res.ok===false?"false":"";resultMsg.value=res.message||"";taskDetectText.textContent=`${d.ok?"已识别":"未确认"} ${d.label||""} ${d.score??""}`;taskOpText.textContent=`${op.name||"-"} / ${op.status||"idle"}`;photoBefore.textContent=ph.before?`操作前: ${ph.before}`:"操作前照片预留";photoAfter.textContent=ph.after?`操作后: ${ph.after}`:"操作后照片预留";taskJson.textContent=JSON.stringify(t,null,2)}
+async function taskUpdate(data){let j=await cmd("/api/task/update",data);if(j.ok)renderTask(j.data)}
+function taskSave(){taskUpdate({task_id:taskId.value,target:taskTarget.value,alarm:taskAlarm.value,stage:taskStage.value,note:taskNote.value})}
+function taskSaveDetect(){let xyz=detectXYZ.value.trim()?detectXYZ.value.split(",").map(x=>+x.trim()):null;taskUpdate({detect:{ok:!!detectLabel.value,label:detectLabel.value,score:detectScore.value===""?null:+detectScore.value,xyz},operation:{name:opName.value,status:opStatus.value}})}
+function taskSaveResult(){let ok=resultOk.value===""?null:resultOk.value==="true";taskUpdate({stage:ok===true?"done":ok===false?"failed":taskStage.value,result:{ok,message:resultMsg.value}})}
+async function taskReset(){let j=await cmd("/api/task/reset");if(j.ok)renderTask(j.data)}
+async function poll(){try{let r=await fetch("/api/status");let j=await r.json();statusData=j.data||{};status.textContent=statusData.ready?"G1: 已连接":"G1: 未连接";status.style.color=statusData.ready?"#a6e3a1":"#f38ba8";detail.textContent=`nav:${statusData.nav||"-"} arm:${statusData.arm_active?"运行":"待机"}`;statusJson.textContent=JSON.stringify(statusData,null,2);if(statusData.actions){allActions.innerHTML=statusData.actions.map(a=>`<button onclick="action('${a}')">${a}</button>`).join("")}renderTask(statusData.task);drawMap()}catch(e){status.textContent="离线";detail.textContent="---"}}
+setInterval(poll,1000);loadMap();poll();
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    robot = None
+
+    def log_message(self, fmt, *args):
+        print("[HTTP] " + fmt % args, flush=True)
+
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if not length:
+            return {}
+        raw = self.rfile.read(length).decode("utf-8")
+        return json.loads(raw) if raw else {}
+
+    def _send_json(self, payload, status=200):
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _ok(self, data=None):
+        self._send_json({"ok": True, "data": data or {}})
+
+    def _error(self, error, status=500):
+        self._send_json({"ok": False, "error": str(error)}, status=status)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        try:
+            if path == "/":
+                raw = INDEX_HTML.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            elif path == "/api/status":
+                self._ok(self.robot.status())
+            elif path == "/api/task":
+                self._ok(self.robot.task_state_snapshot())
+            elif path == "/api/map":
+                self._ok(load_web_map())
+            elif path == "/api/arm/current":
+                self._ok({"joints": self.robot.arm_current()})
+            else:
+                self._error("not found", 404)
+        except Exception as e:
+            self._error(e)
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        try:
+            data = self._read_json()
+            r = self.robot
+            if path == "/api/connect":
+                r.connect()
+                self._ok(r.status())
+            elif path == "/api/move":
+                r.move(data.get("vx", 0), data.get("vy", 0), data.get("wz", 0), data.get("continuous", False))
+                self._ok()
+            elif path == "/api/stop":
+                r.stop()
+                self._ok()
+            elif path == "/api/stand":
+                r.stand()
+                self._ok()
+            elif path == "/api/fsm":
+                r.fsm(data.get("id"))
+                self._ok()
+            elif path == "/api/nav/start":
+                r.nav_start(data.get("map_yaml"), data.get("pcd_path"))
+                self._ok(r.status())
+            elif path == "/api/nav/stop":
+                r.nav_stop()
+                self._ok(r.status())
+            elif path == "/api/nav/goal":
+                r.nav_goal(data.get("x", 0), data.get("y", 0), data.get("yaw", 0))
+                self._ok(r.status())
+            elif path == "/api/nav/reloc":
+                r.nav_reloc(data.get("x", 0), data.get("y", 0), data.get("yaw", 0))
+                self._ok(r.status())
+            elif path == "/api/action":
+                r.action(name=data.get("name"), action_id=data.get("id"))
+                self._ok()
+            elif path == "/api/coordinated":
+                r.coordinated_action(data.get("name"))
+                self._ok()
+            elif path == "/api/speak":
+                r.speak(data.get("text", ""), data.get("speaker_id", 0))
+                self._ok()
+            elif path == "/api/volume":
+                r.volume(data.get("value", 100))
+                self._ok()
+            elif path == "/api/led":
+                r.led(data.get("r", 0), data.get("g", 0), data.get("b", 0))
+                self._ok()
+            elif path == "/api/hand/preset":
+                r.hand_preset(data.get("lr", "r"), data.get("preset"))
+                self._ok()
+            elif path == "/api/hand/angles":
+                r.hand_angles(data.get("lr", "r"), data.get("angles", []))
+                self._ok()
+            elif path == "/api/arm/activate":
+                self._ok({"joints": r.arm_activate()})
+            elif path == "/api/arm/release":
+                r.arm_release()
+                self._ok()
+            elif path == "/api/arm/joints":
+                r.arm_set_joints(data.get("joints", []))
+                self._ok()
+            elif path == "/api/task/update":
+                self._ok(r.task_update(data))
+            elif path == "/api/task/reset":
+                self._ok(r.task_reset())
+            else:
+                self._error("not found", 404)
+        except Exception as e:
+            self._error(e)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default=os.environ.get("HONGTU_SERVICE_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("HONGTU_SERVICE_PORT", "5055")))
+    parser.add_argument("--net-if", default=os.environ.get("HONGTU_G1_NET_IF", "auto"))
+    parser.add_argument("--no-auto-connect", action="store_true")
+    parser.add_argument("--move-timeout", type=float, default=0.8)
+    args = parser.parse_args()
+
+    robot = G1Robot(args.net_if)
+    Handler.robot = robot
+    if not args.no_auto_connect:
+        robot.connect()
+
+    threading.Thread(target=watchdog, args=(robot, args.move_timeout), daemon=True).start()
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+
+    def stop(_signum=None, _frame=None):
+        print("[G1服务] 正在退出", flush=True)
+        robot.shutdown()
+        server.shutdown()
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+    print(f"[G1服务] HTTP listening on {args.host}:{args.port}", flush=True)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

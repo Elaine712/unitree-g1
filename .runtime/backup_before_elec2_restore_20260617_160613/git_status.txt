@@ -1,0 +1,22 @@
+ M .runtime/last_g1_backend_host
+ M README.md
+ M __pycache__/demo_press_button.cpython-38.pyc
+ M __pycache__/g1_remote_client.cpython-38.pyc
+ M __pycache__/g1_robot_service.cpython-38.pyc
+ M demo_press_button.py
+ M demo_pull_switch.py
+ M g1_nav_panel/__pycache__/main.cpython-38.pyc
+ M g1_nav_panel/main.py
+ M g1_robot_service.py
+ M remote_robot_gui.sh
+ M run_pull_switch_demo.sh
+ M start_g1_backend.sh
+ M start_pc_remote_gui.sh
+ M start_web_gui.sh
+?? .runtime/backup_before_elec2_restore_20260617_160613/
+?? .runtime/camera_test/
+?? .runtime/g1_align_sdk_patch/
+?? .runtime/g1_cmdvel_patch/
+?? .runtime/hazard_task_photos/
+?? __pycache__/demo_hazard_pull_task.cpython-38.pyc
+?? demo_hazard_pull_task.py

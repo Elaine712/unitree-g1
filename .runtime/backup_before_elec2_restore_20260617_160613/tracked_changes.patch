@@ -1,0 +1,625 @@
+diff --git a/.runtime/last_g1_backend_host b/.runtime/last_g1_backend_host
+index 2de1ddf..6546d46 100644
+--- a/.runtime/last_g1_backend_host
++++ b/.runtime/last_g1_backend_host
+@@ -1 +1 @@
+-192.168.13.24
++10.231.138.24
+diff --git a/README.md b/README.md
+index 3c8fca6..3286e72 100644
+--- a/README.md
++++ b/README.md
+@@ -483,11 +483,11 @@ GUI 和控制进程部署到 G1 本体，PC 通过 SSH X11/VNC/NoMachine 远程
+ ./remote_robot_gui.sh
+ ```
+ 
+-> 💡 脚本会自动尝试有线 `192.168.123.164` 和无线 `192.168.13.24`
++> 💡 脚本会自动尝试有线 `192.168.123.164` 和无线 `10.231.138.24`
+ 
+ 手动指定：
+ ```bash
+-G1_HOST=192.168.13.24 ./remote_robot_gui.sh
++G1_HOST=10.231.138.24 ./remote_robot_gui.sh
+ ```
+ 
+ #### 方案二：PC 本地 GUI + G1 后台服务
+@@ -512,13 +512,13 @@ GUI 在 PC 本地运行，G1 只运行 HTTP 后台服务。
+ 
+ ```text
+ 有线: 192.168.123.164
+-无线: 192.168.13.24
++无线: 10.231.138.24
+ ```
+ 
+ 手动指定：
+ 
+ ```bash
+-G1_BACKEND_HOST=192.168.13.24 ./start_pc_remote_gui.sh
++G1_BACKEND_HOST=10.231.138.24 ./start_pc_remote_gui.sh
+ G1_BACKEND_HOST=192.168.123.164 ./start_pc_remote_gui.sh
+ ```
+ 
+@@ -532,7 +532,7 @@ cd /home/unitree/zgx_g1
+ 
+ Web 控制台：
+ ```
+-http://192.168.13.24:5055/
++http://10.231.138.24:5055/
+ ```
+ 
+ > 说明：当前不在 G1 本体设置 HongTu 自启动项。`start_g1_backend.sh` 只在你运行 `start_pc_remote_gui.sh` 或手动启动后台时执行。灵巧手端口转发也只会随后台启动时尝试配置一次，不再通过 crontab 开机自启动。
+@@ -566,7 +566,7 @@ Web 控制台包含：
+ ```python
+ from g1_remote_client import G1RemoteClient
+ 
+-client = G1RemoteClient("http://192.168.13.24:5055")
++client = G1RemoteClient("http://10.231.138.24:5055")
+ client.connect()
+ 
+ # 前进
+@@ -590,7 +590,7 @@ client.action("open_arms")  # 展开双臂
+ ```python
+ from g1_remote_client import G1RemoteClient
+ 
+-client = G1RemoteClient("http://192.168.13.24:5055")
++client = G1RemoteClient("http://10.231.138.24:5055")
+ 
+ # 激活 arm_sdk
+ client.arm_activate()
+@@ -732,13 +732,13 @@ demo_press_button.py
+ 同步姿态文件：
+ 
+ ```bash
+-rsync -az ~/Desktop/g1_poses.json unitree@192.168.13.24:/home/unitree/zgx_g1/g1_poses.json
++rsync -az ~/Desktop/g1_poses.json unitree@10.231.138.24:/home/unitree/zgx_g1/g1_poses.json
+ ```
+ 
+ 运行示例：
+ 
+ ```bash
+-ssh unitree@192.168.13.24 \
++ssh unitree@10.231.138.24 \
+   'cd /home/unitree/zgx_g1 && ./demo_press_button.py --taught-press-duration 0.18 --taught-press-steps 4 --hold-seconds 1'
+ ```
+ 
+@@ -798,7 +798,7 @@ demo_pull_switch.py
+ 运行示例：
+ 
+ ```bash
+-ssh unitree@192.168.13.24 \
++ssh unitree@10.231.138.24 \
+   'cd /home/unitree/zgx_g1 && ./demo_pull_switch.py --speak 1'
+ ```
+ 
+@@ -819,8 +819,8 @@ ssh unitree@192.168.123.164 'cd /home/unitree/zgx_g1 && mkdir -p .runtime && noh
+ ssh unitree@192.168.123.164 'cd /home/unitree/zgx_g1 && ./demo_pull_switch.py --poses g1_poses2.json --speak 1'
+ 
+ # 无线
+-ssh unitree@192.168.13.24 'cd /home/unitree/zgx_g1 && mkdir -p .runtime && nohup ./start_g1_backend.sh > .runtime/g1_backend.log 2>&1 < /dev/null & sleep 6 && ss -ltn | grep 5055 && pgrep -af g1_robot_service.py'
+-ssh unitree@192.168.13.24 'cd /home/unitree/zgx_g1 && ./demo_pull_switch.py --poses g1_poses2.json --speak 1'
++ssh unitree@10.231.138.24 'cd /home/unitree/zgx_g1 && mkdir -p .runtime && nohup ./start_g1_backend.sh > .runtime/g1_backend.log 2>&1 < /dev/null & sleep 6 && ss -ltn | grep 5055 && pgrep -af g1_robot_service.py'
++ssh unitree@10.231.138.24 'cd /home/unitree/zgx_g1 && ./demo_pull_switch.py --poses g1_poses2.json --speak 1'
+ ```
+ 
+ ---
+@@ -921,7 +921,7 @@ arm_sdk weight 平滑降到 0
+ ```
+ ┌─────────────┐         WiFi          ┌──────────────┐
+ │   PC 端      │ ◄──────────────────► │   G1 本体     │
+-│ 192.168.1.x │                       │ 192.168.13.24│
++│ 192.168.1.x │                       │ 10.231.138.24│
+ └─────────────┘                       └──────┬───────┘
+                                              │
+                               ┌───────────────┼───────────────┐
+@@ -939,7 +939,7 @@ arm_sdk weight 平滑降到 0
+ | 设备 | IP 地址 | 用途 |
+ |------|---------|------|
+ | G1 本体（有线） | 192.168.123.164 | SSH/部署/调试 |
+-| G1 本体（无线） | 192.168.13.24 | PC GUI / Web / HTTP 后台 |
++| G1 本体（无线） | 10.231.138.24 | PC GUI / Web / HTTP 后台 |
+ | Livox 雷达 | 192.168.123.120 | 激光雷达 |
+ | Inspire 左手 | 192.168.123.210:6000 | Modbus TCP |
+ | Inspire 右手 | 192.168.123.211:6000 | Modbus TCP |
+@@ -978,7 +978,7 @@ HONGTU_SETUP_HAND_RELAY=0 ./start_g1_backend.sh
+ 出现该情况时先手动检查本体后台：
+ 
+ ```bash
+-ssh unitree@192.168.13.24
++ssh unitree@10.231.138.24
+ cd /home/unitree/zgx_g1
+ tail -80 .runtime/g1_backend.log
+ ./start_g1_backend.sh
+@@ -1005,7 +1005,7 @@ HONGTU_G1_NET_IF=eth1 ./start_g1_backend.sh
+ 建议现场只保留一套导航栈运行；切换电脑前先停止当前导航：
+ 
+ ```bash
+-curl -X POST http://192.168.13.24:5055/api/nav/stop
++curl -X POST http://10.231.138.24:5055/api/nav/stop
+ ```
+ 
+ ### 4. 灵巧手端口转发会修改本体 iptables
+diff --git a/__pycache__/demo_press_button.cpython-38.pyc b/__pycache__/demo_press_button.cpython-38.pyc
+index f490489..ede83b7 100644
+Binary files a/__pycache__/demo_press_button.cpython-38.pyc and b/__pycache__/demo_press_button.cpython-38.pyc differ
+diff --git a/__pycache__/g1_remote_client.cpython-38.pyc b/__pycache__/g1_remote_client.cpython-38.pyc
+index 46b06bb..a82eeb8 100644
+Binary files a/__pycache__/g1_remote_client.cpython-38.pyc and b/__pycache__/g1_remote_client.cpython-38.pyc differ
+diff --git a/__pycache__/g1_robot_service.cpython-38.pyc b/__pycache__/g1_robot_service.cpython-38.pyc
+index a9147b9..81e801c 100644
+Binary files a/__pycache__/g1_robot_service.cpython-38.pyc and b/__pycache__/g1_robot_service.cpython-38.pyc differ
+diff --git a/demo_press_button.py b/demo_press_button.py
+index 589a4e1..124e500 100755
+--- a/demo_press_button.py
++++ b/demo_press_button.py
+@@ -15,7 +15,7 @@ def default_host():
+         return env
+     if os.environ.get("USER") == "unitree" or os.path.exists("/home/unitree/zgx_g1"):
+         return "127.0.0.1"
+-    return "192.168.123.164"
++    return "10.231.138.24"
+ 
+ 
+ def default_poses_path():
+diff --git a/demo_pull_switch.py b/demo_pull_switch.py
+index 6e152c5..7200118 100755
+--- a/demo_pull_switch.py
++++ b/demo_pull_switch.py
+@@ -16,7 +16,7 @@ def default_host():
+         return env
+     if os.environ.get("USER") == "unitree" or os.path.exists("/home/unitree/zgx_g1"):
+         return "127.0.0.1"
+-    return "192.168.123.164"
++    return "10.231.138.24"
+ 
+ 
+ def default_poses_path():
+diff --git a/g1_nav_panel/__pycache__/main.cpython-38.pyc b/g1_nav_panel/__pycache__/main.cpython-38.pyc
+index 987627b..990b26a 100644
+Binary files a/g1_nav_panel/__pycache__/main.cpython-38.pyc and b/g1_nav_panel/__pycache__/main.cpython-38.pyc differ
+diff --git a/g1_nav_panel/main.py b/g1_nav_panel/main.py
+index dfda583..3528832 100755
+--- a/g1_nav_panel/main.py
++++ b/g1_nav_panel/main.py
+@@ -1049,6 +1049,8 @@ class MainWindow(QMainWindow):
+         self._remote_goal_pending = False
+         self._remote_goal_was_active = False
+         self._remote_goal_target = None
++        self._remote_goal_final_target = None
++        self._remote_goal_stage = "final"
+         self._remote_nav_running = False
+         self._waypoints = []  # [(name, x, y, yaw, action, speech)]
+         self._tour_running = False
+@@ -3091,11 +3093,7 @@ class MainWindow(QMainWindow):
+                 if nav == "active":
+                     self._remote_goal_was_active = True
+                 elif nav == "succeeded" and goal_matches:
+-                    self._remote_goal_pending = False
+-                    self._remote_goal_was_active = False
+-                    self._remote_goal_target = None
+-                    self._log("[导航] 本体到达目标")
+-                    self._on_goal_done(True)
++                    self._finish_remote_goal(True)
+                 elif nav in ("aborted", "rejected", "preempted", "recalled") and goal_matches:
+                     if nav == "aborted" and self._remote_goal_target and isinstance(data.get("nav_pose"), dict):
+                         try:
+@@ -3104,20 +3102,14 @@ class MainWindow(QMainWindow):
+                             dist = math.hypot(float(pose.get("x", 1e9)) - gx, float(pose.get("y", 1e9)) - gy)
+                             accept = float(os.environ.get("HONGTU_NAV_ACCEPT_RADIUS_M", "0.15"))
+                             if dist <= accept:
+-                                self._remote_goal_pending = False
+-                                self._remote_goal_was_active = False
+-                                self._remote_goal_target = None
+                                 self._log(f"[导航] 接近目标({dist:.2f}m)，按到达处理")
+                                 self._on_nav_status("已到达 ✓")
+-                                self._on_goal_done(True)
++                                self._finish_remote_goal(True)
+                                 return
+                         except Exception:
+                             pass
+-                    self._remote_goal_pending = False
+-                    self._remote_goal_was_active = False
+-                    self._remote_goal_target = None
+                     self._log(f"[导航] 本体目标失败: {nav}")
+-                    self._on_goal_done(False)
++                    self._finish_remote_goal(False)
+ 
+     def _on_nav_status(self, text):
+         self._nav_state_label.setText(text)
+@@ -3129,6 +3121,45 @@ class MainWindow(QMainWindow):
+         if self._tour_running:
+             self._tour_next_step()
+ 
++    def _finish_remote_goal(self, success):
++        if success and self._remote_goal_stage == "transit" and self._remote_goal_final_target:
++            x, y, yaw = self._remote_goal_final_target
++            self._remote_goal_stage = "final"
++            self._remote_goal_target = (x, y, yaw)
++            self._remote_goal_was_active = False
++            self._log(f"[导航] 直线段完成，原地调整朝向 {math.degrees(yaw):.0f}°")
++
++            def worker():
++                try:
++                    self.log_message.emit("[导航] 正在下发最终朝向...")
++                    data = self._g1_remote.nav_goal(x, y, yaw).get("data", {})
++                    self.remote_status_signal.emit(data)
++                    self.log_message.emit("[导航] 最终朝向已下发")
++                except Exception as e:
++                    self._remote_goal_pending = False
++                    self._remote_goal_was_active = False
++                    self._remote_goal_target = None
++                    self._remote_goal_final_target = None
++                    self._remote_goal_stage = "final"
++                    self.log_message.emit(f"[导航] 最终朝向下发失败: {e}")
++                    self._on_goal_done(False)
++
++            threading.Thread(target=worker, daemon=True).start()
++            return
++
++        self._remote_goal_pending = False
++        self._remote_goal_was_active = False
++        self._remote_goal_target = None
++        self._remote_goal_final_target = None
++        self._remote_goal_stage = "final"
++        if success:
++            self._log("[导航] 本体到达目标")
++        self._on_goal_done(success)
++
++    @staticmethod
++    def _angle_abs_diff(a, b):
++        return abs(math.atan2(math.sin(a - b), math.cos(a - b)))
++
+     def _send_nav_goal(self, x, y, yaw, label="[导航] 发送目标"):
+         if self._g1_remote_mode and self._g1_remote and not self._remote_nav_running:
+             self._log("[导航] 请先点击“启动导航”，等待本体运行中后再发送目标")
+@@ -3136,9 +3167,31 @@ class MainWindow(QMainWindow):
+             return
+         self._has_active_goal = True
+         if self._g1_remote_mode and self._g1_remote:
++            target_x, target_y, target_yaw = float(x), float(y), float(yaw)
++            send_yaw = target_yaw
++            self._remote_goal_stage = "final"
++            self._remote_goal_final_target = None
++            if os.environ.get("HONGTU_NAV_STRAIGHT_THEN_ALIGN", "1").lower() in ("1", "true", "yes"):
++                try:
++                    cur_x, cur_y, _ = self._last_pose
++                    dist = math.hypot(target_x - cur_x, target_y - cur_y)
++                    min_dist = float(os.environ.get("HONGTU_NAV_STRAIGHT_MIN_DIST_M", "0.30"))
++                    min_angle = math.radians(float(os.environ.get("HONGTU_NAV_STRAIGHT_MIN_ANGLE_DEG", "10")))
++                    travel_yaw = math.atan2(target_y - cur_y, target_x - cur_x)
++                    if dist >= min_dist and self._angle_abs_diff(travel_yaw, target_yaw) >= min_angle:
++                        send_yaw = travel_yaw
++                        self._remote_goal_stage = "transit"
++                        self._remote_goal_final_target = (target_x, target_y, target_yaw)
++                        self._log(
++                            f"[导航] 直线优先: 先朝行进方向 {math.degrees(travel_yaw):.0f}°，到点后转 {math.degrees(target_yaw):.0f}°"
++                        )
++                except Exception:
++                    send_yaw = target_yaw
++                    self._remote_goal_stage = "final"
++                    self._remote_goal_final_target = None
+             self._remote_goal_pending = True
+             self._remote_goal_was_active = False
+-            self._remote_goal_target = (float(x), float(y), float(yaw))
++            self._remote_goal_target = (target_x, target_y, send_yaw)
+             self._log(f"{label}: ({x:.2f}, {y:.2f})")
+             def worker():
+                 try:
+@@ -3150,7 +3203,7 @@ class MainWindow(QMainWindow):
+                         self.log_message.emit("[导航] 等待重定位完成后下发目标...")
+                         time.sleep(1.0)
+                     self.log_message.emit("[导航] 正在下发本体目标...")
+-                    data = self._g1_remote.nav_goal(x, y, yaw).get("data", {})
++                    data = self._g1_remote.nav_goal(target_x, target_y, send_yaw).get("data", {})
+                     self.remote_status_signal.emit(data)
+                     self.log_message.emit("[导航] 本体目标已下发")
+                     for _ in range(30):
+@@ -3165,6 +3218,8 @@ class MainWindow(QMainWindow):
+                     self._remote_goal_pending = False
+                     self._remote_goal_was_active = False
+                     self._remote_goal_target = None
++                    self._remote_goal_final_target = None
++                    self._remote_goal_stage = "final"
+                     self.log_message.emit(f"[导航] 本体目标下发失败: {e}")
+             threading.Thread(target=worker, daemon=True).start()
+             return
+diff --git a/g1_robot_service.py b/g1_robot_service.py
+index 37b28bb..94c26f1 100755
+--- a/g1_robot_service.py
++++ b/g1_robot_service.py
+@@ -235,6 +235,7 @@ class G1Robot:
+         self.hand_pub_r = None
+         self.hand_state = {"l": {}, "r": {}}
+         self.nav_proc = None
++        self.nav_user_running = False
+         self.nav_bridge_started = False
+         self.nav_status = "stopped"
+         self.nav_last_goal = None
+@@ -247,6 +248,7 @@ class G1Robot:
+         self.nav_reloc_lock = threading.Lock()
+         self.nav_ros_ready = threading.Event()
+         self.nav_goal_pub = None
++        self.nav_cancel_pub = None
+         self.nav_initpose_pub = None
+         self.nav_clear_costmaps = None
+         self.control_paused_for_nav = False
+@@ -402,7 +404,7 @@ class G1Robot:
+             "hand_state": self.hand_state,
+             "moving": self.moving,
+             "nav": self.nav_status,
+-            "nav_running": bool(self.nav_proc and self.nav_proc.poll() is None),
++            "nav_running": bool(self.nav_user_running and self.nav_proc and self.nav_proc.poll() is None),
+             "nav_last_goal": self.nav_last_goal,
+             "nav_last_reloc": self.nav_last_reloc,
+             "nav_last_reloc_error": self.nav_last_reloc_error,
+@@ -476,8 +478,12 @@ class G1Robot:
+     def nav_start(self, map_yaml=None, pcd_path=None):
+         with self.lock:
+             if self.nav_proc and self.nav_proc.poll() is None:
++                self.nav_user_running = True
+                 self.nav_status = "running"
++                self._pause_control_for_nav()
+                 self._start_nav_bridge()
++                if os.environ.get("HONGTU_AUTO_RELOC_ON_NAV_RESTART", "1").lower() not in ("0", "false", "no"):
++                    threading.Thread(target=self.nav_auto_reloc, daemon=True).start()
+                 return
+             self._pause_unitree_localization_for_nav()
+             self._cleanup_stale_nav_processes()
+@@ -508,6 +514,7 @@ class G1Robot:
+                 preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN),
+             )
+             threading.Thread(target=self._nav_log_loop, daemon=True).start()
++            self.nav_user_running = True
+             self.nav_status = "starting"
+             self._start_nav_bridge()
+             if os.environ.get("HONGTU_AUTO_RELOC", "1").lower() not in ("0", "false", "no"):
+@@ -545,6 +552,7 @@ class G1Robot:
+         for line in iter(proc.stdout.readline, ""):
+             self.log("[nav] " + line.rstrip())
+         self.nav_status = "stopped"
++        self.nav_user_running = False
+         self._reset_nav_bridge_state()
+         self.log("[导航] 进程已退出")
+ 
+@@ -552,6 +560,7 @@ class G1Robot:
+         self.nav_bridge_started = False
+         self.nav_ros_ready.clear()
+         self.nav_goal_pub = None
++        self.nav_cancel_pub = None
+         self.nav_initpose_pub = None
+         self.nav_clear_costmaps = None
+         self.nav_pose = None
+@@ -559,6 +568,22 @@ class G1Robot:
+     def nav_stop(self):
+         with self.lock:
+             self.ensure_arm_released("停止导航前")
++            keep_ros = os.environ.get("HONGTU_NAV_STOP_KEEP_ROS", "1").lower() not in ("0", "false", "no")
++            if keep_ros and self.nav_proc and self.nav_proc.poll() is None:
++                try:
++                    if self.nav_cancel_pub:
++                        from actionlib_msgs.msg import GoalID
++                        self.nav_cancel_pub.publish(GoalID())
++                except Exception as e:
++                    self.log(f"[导航] 取消 move_base goal 失败: {e}")
++                self.nav_user_running = False
++                self.nav_status = "stopped"
++                self.nav_last_goal = None
++                if self.ready:
++                    threading.Thread(target=self.stop, daemon=True).start()
++                threading.Thread(target=self._resume_control_after_nav, daemon=True).start()
++                self.log("[导航] 已软停止：保留 ROS 导航栈，便于再次启动和自动重定位")
++                return
+             if self.nav_proc and self.nav_proc.poll() is None:
+                 self.nav_proc.terminate()
+                 try:
+@@ -566,6 +591,7 @@ class G1Robot:
+                 except subprocess.TimeoutExpired:
+                     self.nav_proc.kill()
+             self.nav_proc = None
++            self.nav_user_running = False
+             self.nav_status = "stopped"
+             self._reset_nav_bridge_state()
+             if self.ready:
+@@ -586,7 +612,7 @@ class G1Robot:
+         try:
+             import rospy
+             from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
+-            from actionlib_msgs.msg import GoalStatusArray
++            from actionlib_msgs.msg import GoalID, GoalStatusArray
+             from nav_msgs.msg import Odometry
+             from std_srvs.srv import Empty
+             import tf2_ros
+@@ -597,6 +623,7 @@ class G1Robot:
+             tf_buffer = tf2_ros.Buffer()
+             tf2_ros.TransformListener(tf_buffer)
+             self.nav_goal_pub = rospy.Publisher("/move_base_simple/goal", PoseStamped, queue_size=1)
++            self.nav_cancel_pub = rospy.Publisher("/move_base/cancel", GoalID, queue_size=1)
+             self.nav_initpose_pub = rospy.Publisher("/initialpose", PoseWithCovarianceStamped, queue_size=1)
+             self.nav_clear_costmaps = rospy.ServiceProxy("/move_base/clear_costmaps", Empty)
+ 
+diff --git a/remote_robot_gui.sh b/remote_robot_gui.sh
+index 539c7b1..5572f0f 100755
+--- a/remote_robot_gui.sh
++++ b/remote_robot_gui.sh
+@@ -4,7 +4,7 @@
+ set -e
+ 
+ G1_WIRED_HOST="${G1_WIRED_HOST:-192.168.123.164}"
+-G1_WIFI_HOST="${G1_WIFI_HOST:-192.168.1.24}"
++G1_WIFI_HOST="${G1_WIFI_HOST:-10.231.138.24}"
+ G1_HOST="${G1_HOST:-}"
+ G1_USER="${G1_USER:-unitree}"
+ G1_DIR="${G1_DIR:-/home/unitree/zgx_g1}"
+@@ -54,15 +54,15 @@ discover_g1_host() {
+         return 0
+     fi
+ 
+-    echo "[remote] checking wired ${G1_WIRED_HOST}..." >&2
+-    if can_ssh "$G1_WIRED_HOST"; then
+-        echo "$G1_WIRED_HOST"
++    echo "[remote] checking WiFi ${G1_WIFI_HOST}..." >&2
++    if can_ssh "$G1_WIFI_HOST"; then
++        echo "$G1_WIFI_HOST"
+         return 0
+     fi
+ 
+-    echo "[remote] wired unavailable, checking WiFi ${G1_WIFI_HOST}..." >&2
+-    if can_ssh "$G1_WIFI_HOST"; then
+-        echo "$G1_WIFI_HOST"
++    echo "[remote] WiFi unavailable, checking wired ${G1_WIRED_HOST}..." >&2
++    if can_ssh "$G1_WIRED_HOST"; then
++        echo "$G1_WIRED_HOST"
+         return 0
+     fi
+ 
+@@ -79,7 +79,7 @@ discover_g1_host() {
+         done
+     done
+ 
+-    echo "[remote] 未找到可 SSH 的 G1。可手动指定：G1_HOST=192.168.1.24 ./remote_robot_gui.sh" >&2
++    echo "[remote] 未找到可 SSH 的 G1。可手动指定：G1_HOST=10.231.138.24 ./remote_robot_gui.sh" >&2
+     return 1
+ }
+ 
+diff --git a/run_pull_switch_demo.sh b/run_pull_switch_demo.sh
+index 1fac1bf..f5c0ab8 100755
+--- a/run_pull_switch_demo.sh
++++ b/run_pull_switch_demo.sh
+@@ -5,7 +5,7 @@ set -e
+ 
+ G1_USER="${G1_USER:-unitree}"
+ G1_WIRED_HOST="${G1_WIRED_HOST:-192.168.123.164}"
+-G1_WIFI_HOST="${G1_WIFI_HOST:-192.168.13.24}"
++G1_WIFI_HOST="${G1_WIFI_HOST:-10.231.138.24}"
+ G1_HOST="${G1_HOST:-${G1_BACKEND_HOST:-}}"
+ G1_DIR="${G1_DIR:-/home/unitree/zgx_g1}"
+ G1_POSES="${G1_POSES:-g1_poses2.json}"
+@@ -17,7 +17,7 @@ can_ssh() {
+ }
+ 
+ if [ -z "$G1_HOST" ]; then
+-    for host in "$G1_WIRED_HOST" "$G1_WIFI_HOST"; do
++    for host in "$G1_WIFI_HOST" "$G1_WIRED_HOST"; do
+         if can_ssh "$host"; then
+             G1_HOST="$host"
+             break
+@@ -26,7 +26,7 @@ if [ -z "$G1_HOST" ]; then
+ fi
+ 
+ if [ -z "$G1_HOST" ]; then
+-    echo "[pull-demo] 未找到可 SSH 的 G1。可指定：G1_HOST=192.168.13.24 ./run_pull_switch_demo.sh" >&2
++    echo "[pull-demo] 未找到可 SSH 的 G1。可指定：G1_HOST=10.231.138.24 ./run_pull_switch_demo.sh" >&2
+     exit 1
+ fi
+ 
+diff --git a/start_g1_backend.sh b/start_g1_backend.sh
+index 0814e7e..a9c888b 100755
+--- a/start_g1_backend.sh
++++ b/start_g1_backend.sh
+@@ -12,7 +12,7 @@ mkdir -p "$RUNTIME_DIR"
+ export HONGTU_G1_NET_IF="${HONGTU_G1_NET_IF:-eth0}"
+ export HONGTU_SERVICE_HOST="${HONGTU_SERVICE_HOST:-0.0.0.0}"
+ export HONGTU_SERVICE_PORT="${HONGTU_SERVICE_PORT:-5055}"
+-export HONGTU_NAV_CMD_BRIDGE="${HONGTU_NAV_CMD_BRIDGE:-0}"
++export HONGTU_NAV_CMD_BRIDGE="${HONGTU_NAV_CMD_BRIDGE:-1}"
+ export HONGTU_PAUSE_CONTROL_DURING_NAV="${HONGTU_PAUSE_CONTROL_DURING_NAV:-1}"
+ export HONGTU_NAV_GOAL_BACKOFF_M="${HONGTU_NAV_GOAL_BACKOFF_M:-0.25}"
+ export HONGTU_NAV_GOAL_LATERAL_M="${HONGTU_NAV_GOAL_LATERAL_M:--0.08}"
+diff --git a/start_pc_remote_gui.sh b/start_pc_remote_gui.sh
+index fd5adf3..3d83b8b 100755
+--- a/start_pc_remote_gui.sh
++++ b/start_pc_remote_gui.sh
+@@ -8,11 +8,12 @@ RUNTIME_DIR="${BASE}/.runtime"
+ LAST_HOST_FILE="${RUNTIME_DIR}/last_g1_backend_host"
+ mkdir -p "$RUNTIME_DIR"
+ G1_WIRED_HOST="${G1_WIRED_HOST:-192.168.123.164}"
+-G1_WIFI_HOST="${G1_WIFI_HOST:-192.168.13.24}"
++G1_WIFI_HOST="${G1_WIFI_HOST:-10.231.138.24}"
+ G1_BACKEND_HOST="${G1_BACKEND_HOST:-${G1_HOST:-}}"
+ G1_USER="${G1_USER:-unitree}"
+ G1_BACKEND_PORT="${G1_BACKEND_PORT:-5055}"
+ G1_TUNNEL_PORT="${G1_TUNNEL_PORT:-15055}"
++HONGTU_FORCE_BACKEND_RESTART="${HONGTU_FORCE_BACKEND_RESTART:-0}"
+ SSH_CHECK_OPTS=(-o BatchMode=yes -o ConnectTimeout=2)
+ TUNNEL_PID=""
+ BACKEND_ADDR=""
+@@ -45,11 +46,23 @@ can_ssh() {
+     ssh "${SSH_CHECK_OPTS[@]}" "${G1_USER}@${host}" "true" >/dev/null 2>&1
+ }
+ 
++stop_remote_backend() {
++    local host="$1"
++    ssh "${SSH_CHECK_OPTS[@]}" "${G1_USER}@${host}" \
++        "pids=\$(pgrep -f 'g1_robot_service.py|[.]/start_g1_backend.sh' || true); pids=\$(printf '%s\n' \$pids | grep -v \"^\$\$\\$\" || true); if [ -n \"\$pids\" ]; then kill \$pids >/dev/null 2>&1 || true; fi; for _ in \$(seq 1 20); do ss -ltn | grep -q ':${G1_BACKEND_PORT} ' || exit 0; sleep 0.2; done; pids=\$(pgrep -f 'g1_robot_service.py|[.]/start_g1_backend.sh' || true); pids=\$(printf '%s\n' \$pids | grep -v \"^\$\$\\$\" || true); if [ -n \"\$pids\" ]; then kill -9 \$pids >/dev/null 2>&1 || true; fi; true"
++}
++
+ start_remote_backend() {
+     local host="$1"
+     echo "[pc-gui] backend not running, starting on ${host}..." >&2
++    local remote_env=""
++    for name in HONGTU_NAV_GOAL_BACKOFF_M HONGTU_NAV_GOAL_LATERAL_M HONGTU_NAV_GOAL_YAW_OFFSET_DEG HONGTU_G1_NET_IF; do
++        if [ -n "${!name+x}" ]; then
++            remote_env="${remote_env} ${name}=${!name}"
++        fi
++    done
+     ssh "${SSH_CHECK_OPTS[@]}" "${G1_USER}@${host}" \
+-        "cd /home/unitree/zgx_g1 && mkdir -p .runtime && if ! ss -ltn | grep -q ':${G1_BACKEND_PORT} '; then nohup ./start_g1_backend.sh > .runtime/g1_backend.log 2>&1 < /dev/null & fi"
++        "cd /home/unitree/zgx_g1 && mkdir -p .runtime && if ! ss -ltn | grep -q ':${G1_BACKEND_PORT} '; then${remote_env} nohup ./start_g1_backend.sh > .runtime/g1_backend.log 2>&1 < /dev/null & fi"
+     for _ in $(seq 1 40); do
+         if can_http "$host"; then
+             BACKEND_ADDR="${host}:${G1_BACKEND_PORT}"
+@@ -95,6 +108,10 @@ try_backend_host() {
+     local host="$1"
+     [ -z "$host" ] && return 1
+     echo "[pc-gui] checking backend ${host}:${G1_BACKEND_PORT}..." >&2
++    if [ "$HONGTU_FORCE_BACKEND_RESTART" = "1" ] && can_ssh "$host"; then
++        echo "[pc-gui] restarting backend on ${host}..." >&2
++        stop_remote_backend "$host"
++    fi
+     if can_http "$host"; then
+         BACKEND_ADDR="${host}:${G1_BACKEND_PORT}"
+         BACKEND_HOST="$host"
+@@ -104,8 +121,10 @@ try_backend_host() {
+         if start_remote_backend "$host"; then
+             return 0
+         fi
+-        start_tunnel "$host"
+-        return 0
++        if start_tunnel "$host"; then
++            return 0
++        fi
++        return 1
+     fi
+     return 1
+ }
+@@ -116,7 +135,7 @@ discover_backend() {
+         echo "[pc-gui] 指定的 G1_BACKEND_HOST 不可访问: $G1_BACKEND_HOST" >&2
+         return 1
+     fi
+-    for host in "$LAST_BACKEND_HOST" "$G1_WIFI_HOST" "192.168.1.24" "$G1_WIRED_HOST"; do
++    for host in "$LAST_BACKEND_HOST" "$G1_WIFI_HOST" "$G1_WIRED_HOST"; do
+         try_backend_host "$host" && return 0
+     done
+     for prefix in $(wifi_prefixes); do
+@@ -142,7 +161,7 @@ if discover_backend; then
+     export HONGTU_G1_BACKEND_URL="http://${BACKEND_ADDR}"
+     export HONGTU_REMOTE_AUTO_CONNECT="${HONGTU_REMOTE_AUTO_CONNECT:-1}"
+ else
+-    FALLBACK_HOST="${LAST_BACKEND_HOST:-${G1_WIFI_HOST:-192.168.13.24}}"
++    FALLBACK_HOST="${LAST_BACKEND_HOST:-${G1_WIFI_HOST:-10.231.138.24}}"
+     export HONGTU_G1_BACKEND_URL="http://${FALLBACK_HOST}:${G1_BACKEND_PORT}"
+     export HONGTU_REMOTE_AUTO_CONNECT=0
+     echo "[pc-gui] 自动连接失败，仍打开 GUI，可在左上角手动修改并连接: $HONGTU_G1_BACKEND_URL" >&2
+diff --git a/start_web_gui.sh b/start_web_gui.sh
+index 9bffe6a..856d176 100755
+--- a/start_web_gui.sh
++++ b/start_web_gui.sh
+@@ -3,7 +3,8 @@
+ 
+ set -e
+ 
+-G1_HOST="${G1_HOST:-${G1_BACKEND_HOST:-192.168.123.164}}"
++G1_WIFI_HOST="${G1_WIFI_HOST:-10.231.138.24}"
++G1_HOST="${G1_HOST:-${G1_BACKEND_HOST:-$G1_WIFI_HOST}}"
+ G1_USER="${G1_USER:-unitree}"
+ G1_BACKEND_PORT="${G1_BACKEND_PORT:-5055}"
+ G1_TUNNEL_PORT="${G1_TUNNEL_PORT:-15055}"
