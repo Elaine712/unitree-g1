@@ -4,7 +4,7 @@
 set -e
 
 G1_WIRED_HOST="${G1_WIRED_HOST:-192.168.123.164}"
-G1_WIFI_HOST="${G1_WIFI_HOST:-192.168.1.24}"
+G1_WIFI_HOST="${G1_WIFI_HOST:-10.231.138.24}"
 G1_HOST="${G1_HOST:-}"
 G1_USER="${G1_USER:-unitree}"
 G1_DIR="${G1_DIR:-/home/unitree/zgx_g1}"

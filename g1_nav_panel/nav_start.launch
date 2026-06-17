@@ -10,8 +10,12 @@
     <node pkg="tf" type="static_transform_publisher" name="$(anon base_to_body)"
           args="0.0 0 0.0 3.1416 3.1416 0 body base_link 100" />
 
-    <!-- Livox 雷达驱动 -->
-    <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360.launch" />
+    <!-- Livox 雷达驱动：避开本体 /livox/lidar 的 PointCloud2 发布者 -->
+    <group>
+        <remap from="livox/lidar" to="/hongtu/livox/lidar" />
+        <remap from="/livox/lidar" to="/hongtu/livox/lidar" />
+        <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360.launch" />
+    </group>
 
     <!-- FAST-LIO2 定位 + 加载配置 -->
     <rosparam command="load" file="$(find fastlio)/config/localize.yaml" />

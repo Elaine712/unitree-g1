@@ -481,6 +481,7 @@ class G1Robot:
                 return
             self._pause_unitree_localization_for_nav()
             self._cleanup_stale_nav_processes()
+            self._pause_conflicting_livox_for_nav()
             self._pause_control_for_nav()
             map_yaml = map_yaml or os.environ.get(
                 "HONGTU_MAP_YAML",
@@ -537,6 +538,24 @@ class G1Robot:
             except Exception:
                 pass
         time.sleep(0.3)
+
+    def _pause_conflicting_livox_for_nav(self):
+        patterns = [
+            "./g1_robot",
+            "./livox_driver_ros2",
+            "/home/unitree/unitree_robot_g1/modules/livox",
+        ]
+        stopped = False
+        for pattern in patterns:
+            try:
+                if subprocess.run(["pgrep", "-f", pattern], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                    stopped = True
+                subprocess.run(["pkill", "-f", pattern], check=False)
+            except Exception:
+                pass
+        if stopped:
+            self.log("[导航] 已暂停本体 Livox/底层 ROS 发布，避免与导航 CustomMsg 冲突")
+            time.sleep(0.8)
 
     def _nav_log_loop(self):
         proc = self.nav_proc

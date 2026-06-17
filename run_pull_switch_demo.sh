@@ -9,6 +9,7 @@ G1_WIFI_HOST="${G1_WIFI_HOST:-10.231.138.24}"
 G1_HOST="${G1_HOST:-${G1_BACKEND_HOST:-}}"
 G1_DIR="${G1_DIR:-/home/unitree/zgx_g1}"
 G1_POSES="${G1_POSES:-g1_poses2.json}"
+REMOTE_POSES="${REMOTE_POSES:-.runtime/pull_switch_poses.json}"
 SSH_OPTS=(-o ConnectTimeout=3)
 
 can_ssh() {
@@ -44,6 +45,24 @@ ssh "${SSH_OPTS[@]}" "${G1_USER}@${G1_HOST}" \
          ss -ltn | grep 5055; \
          pgrep -af g1_robot_service.py; \
      fi"
+
+LOCAL_POSES=""
+if [ -f "$G1_POSES" ]; then
+    LOCAL_POSES="$G1_POSES"
+elif [ -f "$HOME/Desktop/$G1_POSES" ]; then
+    LOCAL_POSES="$HOME/Desktop/$G1_POSES"
+elif [ -f "/home/zgx/Desktop/$G1_POSES" ]; then
+    LOCAL_POSES="/home/zgx/Desktop/$G1_POSES"
+fi
+
+if [ -n "$LOCAL_POSES" ]; then
+    echo "[pull-demo] syncing poses: $LOCAL_POSES -> ${G1_HOST}:${G1_DIR}/${REMOTE_POSES}"
+    ssh "${SSH_OPTS[@]}" "${G1_USER}@${G1_HOST}" "mkdir -p '${G1_DIR}/.runtime'"
+    rsync -az "$LOCAL_POSES" "${G1_USER}@${G1_HOST}:${G1_DIR}/${REMOTE_POSES}"
+    G1_POSES="$REMOTE_POSES"
+else
+    echo "[pull-demo] 未找到本地 poses 文件，继续使用 G1 上的: ${G1_POSES}" >&2
+fi
 
 echo "[pull-demo] running pull-switch demo..."
 ssh "${SSH_OPTS[@]}" "${G1_USER}@${G1_HOST}" \

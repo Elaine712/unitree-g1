@@ -2,7 +2,7 @@ map_frame: map
 local_frame: local
 body_frame: body
 imu_topic: /livox/imu
-livox_topic: /livox/lidar
+livox_topic: /hongtu/livox/lidar
 
 local_rate: 30.0
 loop_rate: 1.0
