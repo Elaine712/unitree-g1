@@ -26,8 +26,8 @@ class NavigationFailed(RuntimeError):
 
 DEFAULT_ALIGN_COMMAND = """cd /home/unitree/g1_dev/yolo11 && ./start_dianzha_full_pose_align.sh \
   --max-steps 80 \
-  --target-min-distance-m 1.20 \
-  --target-max-distance-m 1.25 \
+  --target-min-distance-m 1.25 \
+  --target-max-distance-m 1.30 \
   --approach-deadband-deg 2.0 \
   --deadband-deg 1.5 \
   --forward-velocity 0.40 \
@@ -48,8 +48,6 @@ DEFAULT_ALIGN_COMMAND = """cd /home/unitree/g1_dev/yolo11 && ./start_dianzha_ful
   --then-final-yaw \
   --max-steps 12 \
   --deadband-deg 1.5 \
-  --pid-step \
-  --step-profile linear \
   --min-omega 0.45 \
   --max-omega 0.56 \
   --min-duration 0.50 \

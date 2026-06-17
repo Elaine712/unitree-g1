@@ -1,0 +1,19 @@
+[rospy.client][INFO] 2026-06-17 22:08:58,453: init_node, name[/g1_wall_black_line_live_overlay_local_5832_1781705338396], pid[5832]
+[xmlrpc][INFO] 2026-06-17 22:08:58,453: XML-RPC server binding to 0.0.0.0:0
+[xmlrpc][INFO] 2026-06-17 22:08:58,453: Started XML-RPC server [http://10.231.138.74:42587/]
+[rospy.init][INFO] 2026-06-17 22:08:58,453: ROS Slave URI: [http://10.231.138.74:42587/]
+[rospy.impl.masterslave][INFO] 2026-06-17 22:08:58,453: _ready: http://10.231.138.74:42587/
+[rospy.registration][INFO] 2026-06-17 22:08:58,454: Registering with master node http://10.231.138.24:11311
+[xmlrpc][INFO] 2026-06-17 22:08:58,454: xml rpc node: starting XML-RPC server
+[rospy.init][INFO] 2026-06-17 22:08:58,554: registered with master
+[rospy.rosout][INFO] 2026-06-17 22:08:58,554: initializing /rosout core topic
+[rospy.rosout][INFO] 2026-06-17 22:08:58,590: connected to core topic /rosout
+[rospy.simtime][INFO] 2026-06-17 22:08:58,598: /use_sim_time is not set, will not subscribe to simulated time [/clock] topic
+[rospy.internal][INFO] 2026-06-17 22:08:58,776: topic[/camera/aligned_depth_to_color/image_raw] adding connection to [http://10.231.138.24:40117/], count 0
+[rospy.internal][INFO] 2026-06-17 22:08:58,787: topic[/camera/color/image_raw] adding connection to [http://10.231.138.24:40117/], count 0
+[rospy.internal][INFO] 2026-06-17 22:08:58,885: topic[/rosout] adding connection to [/rosout], count 0
+[rospy.core][INFO] 2026-06-17 22:11:15,158: signal_shutdown [atexit]
+[rospy.internal][INFO] 2026-06-17 22:11:16,090: topic[/rosout] removing connection to /rosout
+[rospy.internal][INFO] 2026-06-17 22:11:16,090: topic[/camera/color/image_raw] removing connection to http://10.231.138.24:40117/
+[rospy.internal][INFO] 2026-06-17 22:11:16,090: topic[/camera/aligned_depth_to_color/image_raw] removing connection to http://10.231.138.24:40117/
+[rospy.impl.masterslave][INFO] 2026-06-17 22:11:16,091: atexit

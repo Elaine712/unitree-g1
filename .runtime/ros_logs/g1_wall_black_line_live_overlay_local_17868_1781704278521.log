@@ -1,0 +1,21 @@
+[rospy.client][INFO] 2026-06-17 21:51:18,534: init_node, name[/g1_wall_black_line_live_overlay_local_17868_1781704278521], pid[17868]
+[xmlrpc][INFO] 2026-06-17 21:51:18,534: XML-RPC server binding to 0.0.0.0:0
+[xmlrpc][INFO] 2026-06-17 21:51:18,535: Started XML-RPC server [http://10.231.138.74:43335/]
+[rospy.impl.masterslave][INFO] 2026-06-17 21:51:18,535: _ready: http://10.231.138.74:43335/
+[rospy.init][INFO] 2026-06-17 21:51:18,535: ROS Slave URI: [http://10.231.138.74:43335/]
+[rospy.registration][INFO] 2026-06-17 21:51:18,535: Registering with master node http://10.231.138.24:11311
+[xmlrpc][INFO] 2026-06-17 21:51:18,536: xml rpc node: starting XML-RPC server
+[rospy.init][INFO] 2026-06-17 21:51:18,636: registered with master
+[rospy.rosout][INFO] 2026-06-17 21:51:18,636: initializing /rosout core topic
+[rospy.rosout][INFO] 2026-06-17 21:51:18,675: connected to core topic /rosout
+[rospy.simtime][INFO] 2026-06-17 21:51:18,694: /use_sim_time is not set, will not subscribe to simulated time [/clock] topic
+[rospy.internal][INFO] 2026-06-17 21:51:18,975: topic[/camera/color/image_raw] adding connection to [http://10.231.138.24:36195/], count 0
+[rospy.internal][INFO] 2026-06-17 21:51:18,975: topic[/camera/aligned_depth_to_color/image_raw] adding connection to [http://10.231.138.24:36195/], count 0
+[rospy.internal][INFO] 2026-06-17 21:51:18,975: topic[/rosout] adding connection to [/rosout], count 0
+[rospy.core][INFO] 2026-06-17 21:58:08,800: signal_shutdown [signal-2]
+[rospy.internal][INFO] 2026-06-17 21:58:08,958: topic[/rosout] removing connection to /rosout
+[rospy.internal][INFO] 2026-06-17 21:58:08,959: topic[/camera/color/image_raw] removing connection to http://10.231.138.24:36195/
+[rospy.internal][INFO] 2026-06-17 21:58:08,959: topic[/camera/aligned_depth_to_color/image_raw] removing connection to http://10.231.138.24:36195/
+[rospy.impl.masterslave][INFO] 2026-06-17 21:58:08,961: signal-2
+[rospy.core][INFO] 2026-06-17 21:58:13,878: signal_shutdown [signal-2]
+[rospy.core][INFO] 2026-06-17 22:00:04,095: signal_shutdown [signal-2]
