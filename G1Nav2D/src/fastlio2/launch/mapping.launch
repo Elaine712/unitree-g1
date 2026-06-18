@@ -1,6 +1,7 @@
 <launch>
 
     <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360.launch">
+        <arg name="user_config_path" value="$(find livox_ros_driver2)/config/MID360_config_pc_wired.json" />
     </include>
     <rosparam command="load" file="$(find fastlio)/config/mapping.yaml" />
     <node pkg="fastlio" type="map_builder_node" name="map_builder_node" output="screen"/>
