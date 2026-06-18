@@ -255,7 +255,7 @@ for node in \
   /map_server \
   /slam_reloc \
   /localizer_node; do
-  rosnode kill "$node" >/dev/null 2>&1 || true
+  timeout 1 rosnode kill "$node" >/dev/null 2>&1 || true
 done
 
 patterns=(
@@ -286,9 +286,14 @@ for pat in "${patterns[@]}"; do
     kill -9 "$pid" >/dev/null 2>&1 || true
   done
 done
+
+echo "--- remaining nav processes ---"
+ps -ef | grep -E 'move_base|nav_start|localizer_node|slam_reloc|velocity_smoother|pointcloud_to_laserscan|body2any_pointcloud|downsample_pointcloud|livox_ros_driver2' | grep -v grep || true
+echo "--- remaining nav topics ---"
+rostopic list 2>/dev/null | grep -E '^/(move_base|cmd_vel_smooth|slam_odom|scan|body_cloud|base_link_cloud|livox)' || true
 """
     log("停止并清理导航 ROS")
-    ssh_command(host, user, command, timeout=20, dry_run=dry_run)
+    ssh_command(host, user, command, timeout=45, dry_run=dry_run)
 
 
 def wait_remote_topic(host, user, topic, timeout=20.0, dry_run=False):
