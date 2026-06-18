@@ -63,6 +63,15 @@ def log(msg):
     print(f"[pull-flow] {msg}", flush=True)
 
 
+def speak(client, enabled, text):
+    if not enabled or not text:
+        return
+    try:
+        client.speak(text)
+    except Exception as exc:
+        log(f"语音播报失败，继续执行: {exc}")
+
+
 def default_host():
     return os.environ.get("G1_BACKEND_HOST") or os.environ.get("G1_HOST") or "10.231.138.24"
 
@@ -440,6 +449,11 @@ def main():
     ap.add_argument("--align-timeout", type=float, default=180.0)
     ap.add_argument("--pull-command", default=DEFAULT_PULL_COMMAND)
     ap.add_argument("--pull-timeout", type=float, default=90.0)
+    ap.add_argument("--speak", type=int, default=1, help="1=流程开始/完成语音播报，0=关闭")
+    ap.add_argument("--start-text", default="收到报警信息，开始自主导航处置")
+    ap.add_argument("--waypoint-text-template", default="到达检查点{index}，开始检查")
+    ap.add_argument("--final-waypoint-text-template", default="到达检查点{index}，开始执行任务")
+    ap.add_argument("--done-text", default="拉闸任务完成，请验收")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -455,6 +469,8 @@ def main():
     client = G1RemoteClient(f"http://{args.host}:5055", timeout=4.0)
 
     log("开始短流程：导航 -> 清理导航 -> 相机/YOLO -> 微调 -> 拉闸")
+    if not args.dry_run:
+        speak(client, args.speak, args.start_text)
     stop_perception(args.host, args.user, dry_run=args.dry_run)
     sync_pull_poses(args.host, args.user, args.poses, dry_run=args.dry_run)
 
@@ -465,8 +481,19 @@ def main():
         time.sleep(2.0)
     wait_move_base_ready(args.host, args.user, timeout=25.0, dry_run=args.dry_run)
 
-    for waypoint in run_waypoints:
+    for waypoint_index, waypoint in enumerate(run_waypoints, start=1):
         send_goal_and_wait(client, waypoint, args.nav_timeout, args.accept_radius, dry_run=args.dry_run)
+        if not args.dry_run:
+            waypoint_text_template = (
+                args.final_waypoint_text_template
+                if waypoint_index == len(run_waypoints)
+                else args.waypoint_text_template
+            )
+            speak(
+                client,
+                args.speak,
+                waypoint_text_template.format(index=waypoint_index, name=waypoint["name"]),
+            )
 
     log("已到任务点，停止导航并清理导航 ROS")
     if not args.dry_run:
@@ -522,6 +549,8 @@ def main():
         log(f"完成。到点照片: {arrival_photo}")
         log(f"完成后照片: {done_photo}")
         log(f"桌面备份: {desktop_dir}")
+    if not args.dry_run:
+        speak(client, args.speak, args.done_text)
 
 
 if __name__ == "__main__":
